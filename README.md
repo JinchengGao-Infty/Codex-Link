@@ -75,6 +75,11 @@ For upstream build details, see [docs/install.md](./docs/install.md).
 - [Upstream Codex documentation](https://developers.openai.com/codex)
 - [Upstream contributing notes](./docs/contributing.md)
 
+### Community Acknowledgements
+
+Codex-Link links to and acknowledges the [LINUX DO](https://linux.do/)
+community.
+
 ### License And Attribution
 
 Codex-Link is distributed under the [Apache License 2.0](./LICENSE), the same
@@ -149,6 +154,10 @@ codel
 - [本地开发流程](./docs/link-development.md)
 - [OpenAI Codex 上游文档](https://developers.openai.com/codex)
 - [上游贡献说明](./docs/contributing.md)
+
+### 社区致谢
+
+本开源项目已链接并认可 [LINUX DO](https://linux.do/) 社区。
 
 ### 许可和归属
 
