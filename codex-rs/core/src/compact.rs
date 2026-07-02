@@ -59,6 +59,21 @@ pub fn format_compaction_summary(summary: &str) -> String {
     format!("{SUMMARY_PREFIX}\n{summary}\n{COMPACTED_SUMMARY_END}")
 }
 
+/// Appends a pointer to the full pre-compaction transcript so the model can
+/// recover details the summary dropped instead of guessing or redoing work.
+pub fn append_transcript_reference(
+    summary: &str,
+    transcript_path: Option<&std::path::Path>,
+) -> String {
+    match transcript_path {
+        Some(path) => format!(
+            "{summary}\n\nFull pre-compaction transcript (append-only JSONL): {}\nIf this summary is missing a detail you need (exact error text, an earlier decision, prior tool output), search that file with rg/grep or tail it before redoing work or guessing.",
+            path.display()
+        ),
+        None => summary.to_string(),
+    }
+}
+
 /// Controls whether compaction replacement history must include initial context.
 ///
 /// Pre-turn/manual compaction variants use `DoNotInject`: they replace history with a summary and
@@ -406,7 +421,11 @@ async fn run_compact_task_inner_impl(
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.raw_items();
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
-    let summary_text = format_compaction_summary(&summary_suffix);
+    let transcript_path = sess.hook_transcript_path().await;
+    let summary_text = format_compaction_summary(&append_transcript_reference(
+        &summary_suffix,
+        transcript_path.as_deref(),
+    ));
     let user_messages = collect_user_messages(history_items);
 
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);

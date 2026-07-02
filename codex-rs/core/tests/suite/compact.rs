@@ -1,6 +1,7 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_core::compact::SUMMARIZATION_PROMPT;
+use codex_core::compact::append_transcript_reference;
 use codex_core::compact::format_compaction_summary;
 use codex_core::config::Config;
 use codex_features::Feature;
@@ -133,8 +134,8 @@ fn auto_summary(summary: &str) -> String {
     summary.to_string()
 }
 
-fn summary_with_prefix(summary: &str) -> String {
-    format_compaction_summary(summary)
+fn summary_with_transcript(summary: &str, rollout_path: &std::path::Path) -> String {
+    format_compaction_summary(&append_transcript_reference(summary, Some(rollout_path)))
 }
 
 fn set_test_compact_prompt(config: &mut Config) {
@@ -581,7 +582,7 @@ async fn summarize_context_three_requests_and_instructions() {
     );
 
     let mut messages: Vec<(String, String)> = Vec::new();
-    let expected_summary_message = summary_with_prefix(SUMMARY_TEXT);
+    let expected_summary_message = summary_with_transcript(SUMMARY_TEXT, &rollout_path);
 
     for item in input3 {
         if let Some("message") = item.get("type").and_then(|v| v.as_str()) {
@@ -1045,14 +1046,15 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let server = start_mock_server().await;
 
     let non_openai_provider_name = non_openai_model_provider(&server).name;
-    let codex = test_codex()
+    let test = test_codex()
         .with_config(move |config| {
             config.model_provider.name = non_openai_provider_name;
         })
         .build(&server)
         .await
-        .expect("build codex")
-        .codex;
+        .expect("build codex");
+    let rollout_path = test.session_configured.rollout_path.expect("rollout path");
+    let codex = test.codex;
 
     // user message
     let user_message = "create an app";
@@ -1064,9 +1066,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let second_summary_text = "The task is to create an app. I started to create a react app. then I realized that I need to create a node app.";
     let third_summary_text = "The task is to create an app. I started to create a react app. then I realized that I need to create a node app. then I realized that I need to create a python app.";
     // summary texts with prefix
-    let prefixed_first_summary = summary_with_prefix(first_summary_text);
-    let prefixed_second_summary = summary_with_prefix(second_summary_text);
-    let prefixed_third_summary = summary_with_prefix(third_summary_text);
+    let prefixed_first_summary = summary_with_transcript(first_summary_text, &rollout_path);
+    let prefixed_second_summary = summary_with_transcript(second_summary_text, &rollout_path);
+    let prefixed_third_summary = summary_with_transcript(third_summary_text, &rollout_path);
     // token used count after long work
     let token_count_used = 270_000;
     // token used count after compaction
@@ -3192,7 +3194,6 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     let final_user_message = "post compact follow-up";
     let first_summary = "FIRST_MANUAL_SUMMARY";
     let second_summary = "SECOND_MANUAL_SUMMARY";
-    let expected_second_summary = summary_with_prefix(second_summary);
 
     let server = start_mock_server().await;
 
@@ -3237,7 +3238,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let rollout_path = test.session_configured.rollout_path.expect("rollout path");
+    let codex = test.codex;
+    let expected_second_summary = summary_with_transcript(second_summary, &rollout_path);
 
     codex
         .submit(Op::UserInput {

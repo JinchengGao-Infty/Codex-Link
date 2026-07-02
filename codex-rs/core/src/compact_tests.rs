@@ -184,6 +184,31 @@ fn summary_message_detection_accepts_new_and_legacy_prefixes() {
 }
 
 #[test]
+fn append_transcript_reference_adds_recovery_pointer() {
+    let with_path = append_transcript_reference(
+        "summary text",
+        Some(std::path::Path::new("/tmp/rollout.jsonl")),
+    );
+    assert!(with_path.starts_with("summary text\n"));
+    assert!(with_path.contains("/tmp/rollout.jsonl"));
+
+    assert_eq!(
+        append_transcript_reference("summary text", None),
+        "summary text"
+    );
+}
+
+#[test]
+fn summary_with_transcript_reference_still_detected_as_summary() {
+    let summary = format_compaction_summary(&append_transcript_reference(
+        "summary text",
+        Some(std::path::Path::new("/tmp/rollout.jsonl")),
+    ));
+    assert!(is_summary_message(&summary));
+    assert!(summary.ends_with(COMPACTED_SUMMARY_END));
+}
+
+#[test]
 fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     // Use a small truncation limit so the test remains fast while still validating
     // that oversized user content is truncated.
