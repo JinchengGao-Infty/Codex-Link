@@ -7,6 +7,7 @@ pub(crate) mod hosted_spec;
 pub(crate) mod lifecycle;
 pub(crate) mod network_approval;
 pub(crate) mod orchestrator;
+pub(crate) mod output_spill;
 pub(crate) mod parallel;
 pub(crate) mod registry;
 pub(crate) mod router;
@@ -74,9 +75,13 @@ fn effective_tool_mode(turn_context: &TurnContext) -> ToolMode {
 
 /// Format the combined exec output for sending back to the model.
 /// Includes exit code and duration metadata; truncates large bodies safely.
+/// When `spill` is provided and the body is truncated, the full output is
+/// written to a sidecar file and its path is included so the model can
+/// recover the dropped middle instead of guessing or re-running the command.
 pub fn format_exec_output_for_model(
     exec_output: &ExecToolCallOutput,
     truncation_policy: TruncationPolicy,
+    spill: Option<output_spill::ExecOutputSpill<'_>>,
 ) -> String {
     // round to 1 decimal place
     let duration_seconds = ((exec_output.duration.as_secs_f32()) * 10.0).round() / 10.0;
@@ -85,7 +90,48 @@ pub fn format_exec_output_for_model(
 
     let total_lines = content.lines().count();
 
-    let formatted_output = truncate_text(&content, truncation_policy);
+    // Ground truth for "was it truncated": run the policy once and compare,
+    // instead of guessing from byte approximations that diverge from token
+    // budgets on dense content.
+    let formatted_full = truncate_text(&content, truncation_policy);
+    let truncated = formatted_full.len() != content.len();
+    // Below this budget the pointer line would displace the very content it
+    // points at, so tightly-capped outputs keep the plain truncation behavior.
+    const MIN_SPILL_BYTE_BUDGET: usize = 2_048;
+    let spill_section = if truncated && truncation_policy.byte_budget() >= MIN_SPILL_BYTE_BUDGET {
+        spill
+            .and_then(|spill| output_spill::spill_exec_output(&spill, &content))
+            .map(|full_output_path| {
+                format!(
+                    "Full untruncated output saved to: {} — if a detail from the truncated middle matters, search that file with rg/grep or tail it instead of re-running the command.",
+                    full_output_path.display()
+                )
+            })
+    } else {
+        None
+    };
+    // Reserve the pointer line's cost from the body budget so the combined
+    // message stays within the original policy and is not re-truncated by the
+    // history-recording layer (which would cut through the path itself).
+    let body_policy = match &spill_section {
+        Some(section) => match truncation_policy {
+            TruncationPolicy::Bytes(bytes) => {
+                TruncationPolicy::Bytes(bytes.saturating_sub(section.len() + 1).max(1))
+            }
+            TruncationPolicy::Tokens(tokens) => TruncationPolicy::Tokens(
+                tokens
+                    .saturating_sub(codex_utils_output_truncation::approx_token_count(section) + 1)
+                    .max(1),
+            ),
+        },
+        None => truncation_policy,
+    };
+
+    let formatted_output = if spill_section.is_some() {
+        truncate_text(&content, body_policy)
+    } else {
+        formatted_full
+    };
 
     let mut sections = Vec::new();
 
@@ -93,6 +139,9 @@ pub fn format_exec_output_for_model(
     sections.push(format!("Wall time: {duration_seconds} seconds"));
     if total_lines != formatted_output.lines().count() {
         sections.push(format!("Total output lines: {total_lines}"));
+    }
+    if let Some(spill_section) = spill_section {
+        sections.push(spill_section);
     }
 
     sections.push("Output:".to_string());

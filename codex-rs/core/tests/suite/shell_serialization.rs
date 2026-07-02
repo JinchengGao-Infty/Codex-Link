@@ -446,10 +446,14 @@ async fn shell_command_output_is_not_truncated_over_10k_bytes() -> Result<()> {
         .and_then(Value::as_str)
         .expect("shell_command output string");
 
+    // Truncation over the budget spills the full output to a sidecar file;
+    // the reserved pointer line makes the truncated span slightly larger than
+    // the 1-byte overflow itself.
     let expected_pattern = r"(?s)^Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
+Full untruncated output saved to: [^\n]+
 Output:
-1*…1 chars truncated…1*$";
+1*…\d+ chars truncated…1*$";
     assert_regex_match(expected_pattern, output);
 
     Ok(())

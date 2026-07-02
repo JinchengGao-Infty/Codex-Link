@@ -182,13 +182,15 @@ async fn tool_call_output_exceeds_limit_truncated_chars_limit() -> Result<()> {
         "expected truncated shell output to be plain text"
     );
 
-    let truncated_pattern = r#"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nTotal output lines: 100000\nOutput:\n.*?…\d+ chars truncated….*$"#;
+    let truncated_pattern = r#"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nTotal output lines: 100000\nFull untruncated output saved to: [^\n]+\nOutput:\n.*?…\d+ chars truncated….*$"#;
 
     assert_regex_match(truncated_pattern, &output);
 
+    // The spill header line ("Full untruncated output saved to: <path>")
+    // adds a path-dependent ~150-250 chars on top of the ~10k truncated body.
     let len = output.len();
     assert!(
-        (9_900..=10_100).contains(&len),
+        (9_900..=10_500).contains(&len),
         "expected ~10k chars after truncation, got {len}"
     );
 
@@ -260,6 +262,7 @@ async fn tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> {
     let truncated_pattern = r#"(?s)^Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Total output lines: 100000
+Full untruncated output saved to: [^\n]+
 Output:
 1
 2
@@ -267,7 +270,7 @@ Output:
 4
 5
 6
-.*…137224 tokens truncated.*
+.*…\d+ tokens truncated.*
 99999
 100000
 $"#;
