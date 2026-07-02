@@ -1,3 +1,147 @@
+# Codex-Link Fork Contract
+
+This checkout is the Codex-Link fork of OpenAI Codex CLI. Preserve upstream
+history and keep Link-specific changes small enough to merge forward from
+`upstream/main`.
+
+## Fork hygiene
+
+- Treat `upstream` as the OpenAI repository and `origin` as the future
+  Codex-Link public fork.
+- Keep public fork documentation in `docs/link-fork.md` and local workflow notes
+  in `docs/link-development.md`.
+- Do not publish binaries or npm packages under upstream `@openai/*` names.
+- Preserve `LICENSE`, `NOTICE`, and upstream attribution when redistributing.
+- Prefer new modules, crates, extensions, or small core seams for Link-specific
+  behavior instead of editing high-churn upstream orchestration files.
+
+## Current Link architecture goal
+
+Codex-Link is exploring two first-class runtime systems that should survive
+compaction and long sessions:
+
+- `Link Context Engine`: structured task/session state that is injected into
+  model context independently of transcript summaries.
+- `Link Job Store`: durable local tracking for long-running commands and
+  background work, with event-triggered notifications instead of model polling.
+
+Do not treat this as "make the compact prompt better." The core invariant is:
+after any manual, pre-turn, mid-turn, local, or remote compaction, the next model
+turn must still receive a bounded, verifiable capsule containing the active
+goal, success criteria, current progress, next action, touched files, verified
+evidence, blockers, and active background jobs.
+
+## Context design invariants
+
+- Keep a structured `GoalCard` / context capsule separate from natural-language
+  compact summaries.
+- The capsule is model-visible but bounded; target roughly 800-1500 tokens for
+  normal sessions and enforce a hard cap.
+- Store evidence as small typed records, not as one giant summary. Useful event
+  types include user instruction, decision, observation, file change, test
+  result, command result, job event, blocker, and plan update.
+- Preserve provenance on every evidence record: source, source reference,
+  related paths/symbols, confidence, stale flag, and created time.
+- Never let recalled memory override current file state without verification.
+  If a claim depends on repository contents, reread the file or diff.
+- Do not write fast-changing session/job state into `AGENTS.md`; use a sidecar
+  store under a Link-owned location.
+- Large tool outputs belong in files or a database with bounded previews in
+  prompt context.
+- Snipping or compacting must not break tool-use/tool-result pairing.
+
+## Cursor-derived context lessons
+
+Cursor's public docs and engineering posts describe context as a layered
+runtime, not a larger static prompt. Codex-Link should adopt the same
+invariants without copying proprietary implementation details.
+
+- Separate static rules from dynamic discovery. Always-loaded context should be
+  small; larger rules, skills, tool descriptions, logs, and history should be
+  discoverable through local files or tools with stable references.
+- Treat `AGENTS.md` and rule files as path-scoped context. Parent directory
+  instructions should combine with nested instructions, and more specific
+  instructions should take precedence when a task touches files under that
+  subtree.
+- Prefer typed, triggerable rule metadata over unstructured prompt bloat when
+  possible: always-apply, path/glob-scoped, description-selected, and
+  manually-invoked rules are different context classes.
+- Store long tool output, terminal history, MCP/tool descriptions, and compacted
+  transcript history as files or records, then inject short references and
+  bounded previews. After compaction, the model must be able to search or tail
+  those references to recover omitted details.
+- Retrieval should be hybrid. Exact string/regex/path search must stay fresh
+  enough to find the agent's own writes; semantic retrieval is useful for
+  conceptual discovery but must not replace current-file verification.
+- Broad exploration should run in an isolated context when possible and return
+  concise findings with provenance, rather than dumping many raw files into the
+  main conversation.
+- Hooks are useful for observation, policy, and context injection, but compact
+  survival must be enforced by the harness/context contributor, not by a
+  best-effort hook alone.
+
+## Background job invariants
+
+- Long-running work must not be supervised by repeated model calls.
+- Starting a background command should return a stable job ID quickly.
+- Job state should include command, cwd, owner session/thread/turn, status,
+  start/end timestamps, exit code, stdout/stderr paths, bounded tail, parsed
+  metrics, trigger policy, and callback policy.
+- Provide local observation controls such as job list/status/tail/read/cancel
+  and a local wait with timeout; these must not require model reasoning loops.
+- Completion or trigger events should inject one bounded task notification into
+  the session. Repeated notifications need idempotency or a notified flag.
+- Initial write-capable background agents require explicit snapshot, undo, or
+  worktree ownership. Start with read-only delegation/background research unless
+  that ownership model is implemented.
+
+## Background UI and polling boundary
+
+The upstream-style background terminal UI is not enough for Link. It can show
+that a unified-exec process is still running and expose `/ps` / `/stop`, but if
+the model still has to call empty `write_stdin` or equivalent polling to watch
+the job, it is a fake background workflow that burns inference budget.
+
+Codex-Link should treat model-driven polling as a bug or temporary fallback.
+The desired runtime contract is:
+
+- Reuse the existing TUI background-terminal identity where possible. The
+  native `process_id` is the minimum stable Link job ID.
+- Enrich existing `/ps` and footer surfaces with Link job metadata instead of
+  creating a separate first-pass background-task UI.
+- Surface `background_description`, declared triggers, last trigger, status,
+  and bounded recent output in `/ps`.
+- Footer text may stay compact, but it should represent background jobs, not
+  encourage the model to poll them.
+- Trigger evaluation, no-output timers, metric thresholds, plateau detection,
+  and process exit observation must run locally in the harness/job store.
+- When a trigger fires, inject one bounded model-visible event and mark it
+  notified. Do not require a model loop to discover that the event happened.
+- Manual `/ps`, `tail`, or status checks are user/operator observation tools;
+  they are not the supervision mechanism for long-running work.
+
+## Preferred implementation path
+
+1. Add a Link extension or new crate that observes turn/tool/thread lifecycle
+   and injects a compact context capsule through existing extension seams.
+2. Add a small persistent task/evidence/job store owned by Link. Keep it outside
+   Codex's native session schema until the design is stable.
+3. Add background job tools and notifications that reuse existing process/PTY
+   machinery where possible.
+4. Only after the extension path proves insufficient, add a narrow core seam
+   such as a compaction lifecycle contributor. Keep the seam generic and
+   documented.
+5. Avoid changing `compact.rs`, `session/turn.rs`, or context manager internals
+   until a smaller extension-based stage has failed for a concrete reason.
+
+## Reference policy
+
+It is acceptable to study OpenCode, Claude Code SDK documentation, Cursor,
+Augment, OpenCoder, and Claude-Code-like open-source projects for architecture
+patterns. Do not copy code, prompts, names, or exact implementations from
+Claude Code reimplementations or decompilation-informed projects. Treat those
+as behavior references only and reimplement clean-room in Codex-Link.
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:

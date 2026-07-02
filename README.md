@@ -1,3 +1,20 @@
+<p align="center"><strong>Codex-Link</strong> is an independent, Apache-2.0 community fork of OpenAI Codex CLI.</p>
+
+Codex-Link tracks the upstream OpenAI Codex CLI codebase while developing a
+more open fork workflow, local-first reliability fixes, clearer diagnostics,
+and extension surfaces that can move without waiting for invitation-only
+upstream contribution review.
+
+- Fork notes and roadmap: [docs/link-fork.md](./docs/link-fork.md)
+- Local development workflow: [docs/link-development.md](./docs/link-development.md)
+- Upstream baseline at fork creation:
+  `openai/codex@db887d03e1 fix(core) Remove full text websocket trace (#30757)`
+
+Codex-Link preserves the upstream Apache-2.0 license, NOTICE file, and original
+project attribution. The original upstream README starts below.
+
+---
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
