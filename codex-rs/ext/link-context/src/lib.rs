@@ -48,6 +48,8 @@ use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyStatus;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_state::ThreadGoal;
 use codex_state::ThreadGoalStatus;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -66,17 +68,33 @@ const MAX_PENDING_BACKGROUND_EVENTS: usize = 16;
 const MAX_RECORDED_BACKGROUND_EVENT_KEYS: usize = 128;
 const MAX_BACKGROUND_EVENT_TAIL_CHARS: usize = 2_000;
 
+pub mod evidence;
+mod persistence;
+mod tool;
+
+pub use evidence::EvidenceKind;
+pub use evidence::EvidenceRecord;
+pub use evidence::EvidenceSource;
+use evidence::push_evidence;
+pub use tool::RECORD_LINK_CONTEXT_TOOL_NAME;
+use tool::RecordLinkContextTool;
+
 /// Thread-scoped Link context that should survive transcript compaction.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct LinkContextState {
     pub active_goal: Option<String>,
     pub success_criteria: Vec<String>,
     pub current_progress: Vec<String>,
     pub next_action: Option<String>,
     pub files_touched: Vec<String>,
-    pub verified_evidence: Vec<String>,
+    pub verified_evidence: Vec<EvidenceRecord>,
     pub active_background_jobs: Vec<String>,
     pub open_blockers: Vec<String>,
+    /// Path to the session's full rollout transcript; lets the model recover
+    /// details dropped by any compaction strategy, including remote ones that
+    /// never produce a local summary to annotate.
+    pub session_transcript: Option<String>,
 }
 
 impl LinkContextState {
@@ -104,7 +122,7 @@ impl LinkContextState {
             && self
                 .verified_evidence
                 .iter()
-                .all(|value| value.trim().is_empty())
+                .all(|record| record.summary.trim().is_empty())
             && self
                 .active_background_jobs
                 .iter()
@@ -127,13 +145,16 @@ impl LinkContextState {
         append_unique_values(&mut self.current_progress, &other.current_progress, None);
         merge_option(&mut self.next_action, &other.next_action);
         append_unique_values(&mut self.files_touched, &other.files_touched, None);
-        append_unique_values(&mut self.verified_evidence, &other.verified_evidence, None);
+        for record in &other.verified_evidence {
+            push_evidence(&mut self.verified_evidence, record.clone(), usize::MAX);
+        }
         append_unique_values(
             &mut self.active_background_jobs,
             &other.active_background_jobs,
             None,
         );
         append_unique_values(&mut self.open_blockers, &other.open_blockers, None);
+        merge_option(&mut self.session_transcript, &other.session_transcript);
     }
 
     fn merged_with_goal(&self, goal: &ThreadGoal) -> Self {
@@ -174,6 +195,7 @@ pub struct LinkContextStore {
     background_jobs: Mutex<BTreeMap<String, NativeBackgroundJob>>,
     pending_background_events: Mutex<VecDeque<BackgroundTriggerEvent>>,
     background_event_keys: Mutex<VecDeque<String>>,
+    persist_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl LinkContextStore {
@@ -184,19 +206,110 @@ impl LinkContextStore {
 
     /// Applies an in-place update to the recorded Link context.
     pub fn update(&self, update: impl FnOnce(&mut LinkContextState)) {
+        self.update_state(update);
+        self.persist();
+    }
+
+    fn update_state(&self, update: impl FnOnce(&mut LinkContextState)) {
         let mut state = self.state();
         update(&mut state);
     }
 
+    /// Enables durable sidecar persistence, first hydrating from any snapshot
+    /// a previous process recorded for this thread.
+    pub(crate) fn attach_persistence(&self, path: std::path::PathBuf) {
+        if let Some(persisted) = persistence::load(&path) {
+            self.hydrate_from(persisted);
+        }
+        *self
+            .persist_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path);
+        self.persist();
+    }
+
+    fn hydrate_from(&self, persisted: persistence::PersistedLinkContext) {
+        let persistence::PersistedLinkContext {
+            version: _,
+            state,
+            background_jobs,
+            pending_background_events,
+            background_event_keys,
+        } = persisted;
+        let restored_jobs = !background_jobs.is_empty();
+        {
+            let mut jobs = self.background_jobs();
+            for (process_id, job) in background_jobs {
+                jobs.entry(process_id).or_insert(job);
+            }
+        }
+        {
+            let mut keys = self.background_event_keys();
+            for key in background_event_keys {
+                if !keys.iter().any(|existing| existing == &key) {
+                    keys.push_back(key);
+                }
+            }
+            let overflow = keys
+                .len()
+                .saturating_sub(MAX_RECORDED_BACKGROUND_EVENT_KEYS);
+            if overflow > 0 {
+                keys.drain(0..overflow);
+            }
+        }
+        self.requeue_background_events_front(pending_background_events);
+        self.update_state(|current| {
+            // Everything on disk predates this process; flag it so the model
+            // re-verifies before treating a restored fact as load-bearing.
+            let mut restored_state = state;
+            for record in &mut restored_state.verified_evidence {
+                record.stale = true;
+            }
+            current.merge_from(&restored_state);
+            if restored_jobs {
+                push_evidence(
+                    &mut current.verified_evidence,
+                    EvidenceRecord::host(
+                        EvidenceKind::Observation,
+                        "Link context restored from disk; background job liveness has not been re-verified after restart — check the process before relying on it.",
+                    ),
+                    MAX_RECORDED_TOOL_EVENTS,
+                );
+            }
+        });
+    }
+
+    /// Writes the current in-memory state to the sidecar file, if attached.
+    /// Callers must not hold any of the store's locks.
+    fn persist(&self) {
+        let Some(path) = self
+            .persist_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let persisted = persistence::PersistedLinkContext {
+            version: persistence::PERSISTED_LINK_CONTEXT_VERSION,
+            state: self.state().clone(),
+            background_jobs: self.background_jobs().clone(),
+            pending_background_events: self.pending_background_events().iter().cloned().collect(),
+            background_event_keys: self.background_event_keys().iter().cloned().collect(),
+        };
+        persistence::save(&path, &persisted);
+    }
+
     fn record_tool_finish(&self, input: &ToolFinishInput<'_>) {
-        let event = format_tool_finish_event(input);
+        let event = EvidenceRecord::host(EvidenceKind::ToolResult, format_tool_finish_event(input))
+            .with_source_ref(format!("turn {}, call {}", input.turn_id, input.call_id));
         let background_job = native_background_job_from_tool_finish(input);
         let background_update = background_job.map(|job| self.upsert_background_job(job));
         if let Some((_old_summary, background_job)) = background_update.as_ref() {
             self.refresh_pending_background_events_for_job(background_job);
         }
         self.update(|state| {
-            push_unique_capped(
+            push_evidence(
                 &mut state.verified_evidence,
                 event,
                 MAX_RECORDED_TOOL_EVENTS,
@@ -209,9 +322,12 @@ impl LinkContextStore {
                 }
                 let background_summary = background_job.summary();
                 push_unique(&mut state.active_background_jobs, &background_summary);
-                push_unique_capped(
+                push_evidence(
                     &mut state.verified_evidence,
-                    format!("Native background exec started: {background_summary}"),
+                    EvidenceRecord::host(
+                        EvidenceKind::JobEvent,
+                        format!("Native background exec started: {background_summary}"),
+                    ),
                     MAX_RECORDED_TOOL_EVENTS,
                 );
             }
@@ -241,9 +357,12 @@ impl LinkContextStore {
                     .retain(|existing| existing != &old_summary);
             }
             push_unique(&mut state.active_background_jobs, &summary);
-            push_unique_capped(
+            push_evidence(
                 &mut state.verified_evidence,
-                format!("Native background exec registered: {summary}"),
+                EvidenceRecord::host(
+                    EvidenceKind::JobEvent,
+                    format!("Native background exec registered: {summary}"),
+                ),
                 MAX_RECORDED_TOOL_EVENTS,
             );
         });
@@ -258,18 +377,22 @@ impl LinkContextStore {
         };
 
         let summary = job.summary();
-        let exit_evidence = format!(
-            "Native background exec session {} ended with exit_code={} status={:?}: {}",
-            job.process_id,
-            event.exit_code,
-            event.status,
-            truncate_chars(&job.description, MAX_TOOL_OUTPUT_PREVIEW_CHARS)
-        );
+        let exit_evidence = EvidenceRecord::host(
+            EvidenceKind::JobEvent,
+            format!(
+                "Native background exec session {} ended with exit_code={} status={:?}: {}",
+                job.process_id,
+                event.exit_code,
+                event.status,
+                truncate_chars(&job.description, MAX_TOOL_OUTPUT_PREVIEW_CHARS)
+            ),
+        )
+        .with_source_ref(format!("process {}", job.process_id));
         self.update(|state| {
             state
                 .active_background_jobs
                 .retain(|existing| existing != &summary);
-            push_unique_capped(
+            push_evidence(
                 &mut state.verified_evidence,
                 exit_evidence,
                 MAX_RECORDED_TOOL_EVENTS,
@@ -297,14 +420,18 @@ impl LinkContextStore {
             .unwrap_or_else(|| event.declared_triggers.clone());
         let log_path = job.as_ref().and_then(|job| job.log_path.clone());
 
-        let evidence = format!(
-            "Native background exec session {} fired trigger `{}`: {}",
-            event.process_id,
-            event.trigger,
-            truncate_chars(&event.reason, MAX_TOOL_OUTPUT_PREVIEW_CHARS)
-        );
+        let evidence = EvidenceRecord::host(
+            EvidenceKind::JobEvent,
+            format!(
+                "Native background exec session {} fired trigger `{}`: {}",
+                event.process_id,
+                event.trigger,
+                truncate_chars(&event.reason, MAX_TOOL_OUTPUT_PREVIEW_CHARS)
+            ),
+        )
+        .with_source_ref(format!("process {}", event.process_id));
         self.update(|state| {
-            push_unique_capped(
+            push_evidence(
                 &mut state.verified_evidence,
                 evidence,
                 MAX_RECORDED_TOOL_EVENTS,
@@ -322,20 +449,25 @@ impl LinkContextStore {
 
     fn enqueue_background_event(&self, event: BackgroundTriggerEvent) {
         if self.merge_pending_background_event(&event) {
+            self.persist();
             return;
         }
         self.remove_pending_background_events_superseded_by(&event);
 
         if !self.record_background_event_key(&event.event_key) {
+            self.persist();
             return;
         }
 
-        let mut pending = self.pending_background_events();
-        pending.push_back(event);
-        let overflow = pending.len().saturating_sub(MAX_PENDING_BACKGROUND_EVENTS);
-        if overflow > 0 {
-            pending.drain(0..overflow);
+        {
+            let mut pending = self.pending_background_events();
+            pending.push_back(event);
+            let overflow = pending.len().saturating_sub(MAX_PENDING_BACKGROUND_EVENTS);
+            if overflow > 0 {
+                pending.drain(0..overflow);
+            }
         }
+        self.persist();
     }
 
     fn record_background_event_key(&self, event_key: &str) -> bool {
@@ -401,28 +533,35 @@ impl LinkContextStore {
     }
 
     fn pop_pending_background_events(&self) -> Vec<BackgroundTriggerEvent> {
-        let mut pending = self.pending_background_events();
-        if pending.is_empty() {
-            return Vec::new();
-        }
-        pending.drain(..).collect()
+        let events: Vec<BackgroundTriggerEvent> = {
+            let mut pending = self.pending_background_events();
+            if pending.is_empty() {
+                return Vec::new();
+            }
+            pending.drain(..).collect()
+        };
+        self.persist();
+        events
     }
 
     fn requeue_background_events_front(&self, events: Vec<BackgroundTriggerEvent>) {
         if events.is_empty() {
             return;
         }
-        let mut pending = self.pending_background_events();
-        for event in events.into_iter().rev() {
-            if pending
-                .iter()
-                .any(|existing| existing.event_key == event.event_key)
-            {
-                continue;
+        {
+            let mut pending = self.pending_background_events();
+            for event in events.into_iter().rev() {
+                if pending
+                    .iter()
+                    .any(|existing| existing.event_key == event.event_key)
+                {
+                    continue;
+                }
+                pending.push_front(event);
             }
-            pending.push_front(event);
+            pending.truncate(MAX_PENDING_BACKGROUND_EVENTS);
         }
-        pending.truncate(MAX_PENDING_BACKGROUND_EVENTS);
+        self.persist();
     }
 
     fn record_file_change(&self, item: &FileChangeItem) {
@@ -433,10 +572,11 @@ impl LinkContextStore {
 
         let status = patch_status_label(item.status.as_ref());
         let file_count = paths.len();
-        let evidence = format!(
-            "Patch {status} touched {file_count} file(s): {}",
-            truncate_chars(&paths.join(", "), MAX_TOOL_OUTPUT_PREVIEW_CHARS)
-        );
+        let evidence = EvidenceRecord::host(
+            EvidenceKind::FileChange,
+            format!("Patch {status} touched {file_count} file(s)"),
+        )
+        .with_related_paths(paths.clone());
         self.update(|state| {
             if matches!(item.status, Some(PatchApplyStatus::Completed)) {
                 append_unique_values_with_char_limit(
@@ -446,7 +586,7 @@ impl LinkContextStore {
                     DEFAULT_MAX_FIELD_CHARS,
                 );
             }
-            push_unique_capped(
+            push_evidence(
                 &mut state.verified_evidence,
                 evidence,
                 MAX_RECORDED_TOOL_EVENTS,
@@ -479,7 +619,8 @@ impl LinkContextStore {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct NativeBackgroundJob {
     process_id: String,
     description: String,
@@ -575,7 +716,8 @@ impl NativeBackgroundJob {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct BackgroundTriggerEvent {
     event_key: String,
     process_id: String,
@@ -855,11 +997,28 @@ impl ContextContributor for LinkContextExtension {
             if let Some(goal) = self.current_goal(input.thread_id).await {
                 state = state.merged_with_goal(&goal);
             }
-            state
+            if state.session_transcript.is_none() {
+                state.session_transcript = self.session_transcript_path(input.thread_id).await;
+            }
+            let mut fragments: Vec<PromptFragment> = state
                 .render_capsule()
                 .map(|capsule| PromptFragment::new(PromptSlot::ContextualUser, capsule))
                 .into_iter()
-                .collect()
+                .collect();
+            // Deliver pending background events with whichever turn starts next
+            // (user, goal continuation, or background callback). Waiting for an
+            // idle slot starves these events while an active goal keeps winning
+            // the idle race with its own continuation turns.
+            if let Some(store) = input.thread_store.get::<LinkContextStore>() {
+                let events = store.pop_pending_background_events();
+                if !events.is_empty() {
+                    fragments.push(PromptFragment::new(
+                        PromptSlot::ContextualUser,
+                        render_background_events(&events),
+                    ));
+                }
+            }
+            fragments
         })
     }
 }
@@ -871,6 +1030,22 @@ impl ThreadLifecycleContributor<codex_core::config::Config> for LinkContextExten
     ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             self.ensure_background_runtime(input.thread_store);
+            // Review subagents are ephemeral; only durable threads get a
+            // sidecar file. Resumed threads run this same path, so hydration
+            // after a process restart happens here as well.
+            let durable = input.persistent_thread_state_available
+                && !matches!(
+                    input.session_source,
+                    SessionSource::SubAgent(SubAgentSource::Review)
+                );
+            if durable {
+                let store = input.thread_store.get_or_init(LinkContextStore::default);
+                let path = persistence::link_context_file_path(
+                    &input.config.codex_home,
+                    input.thread_store.level_id(),
+                );
+                store.attach_persistence(path);
+            }
         })
     }
 
@@ -938,6 +1113,17 @@ impl TurnEventContributor for LinkContextExtension {
     }
 }
 
+impl codex_extension_api::ToolContributor for LinkContextExtension {
+    fn tools(
+        &self,
+        _session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+    ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>> {
+        let store = thread_store.get_or_init(LinkContextStore::default);
+        vec![Arc::new(RecordLinkContextTool::new(store))]
+    }
+}
+
 impl LinkContextExtension {
     async fn current_goal(&self, thread_id: codex_protocol::ThreadId) -> Option<ThreadGoal> {
         let goal_state = self.goal_state.as_ref()?;
@@ -947,6 +1133,12 @@ impl LinkContextExtension {
             .await
             .ok()??;
         should_include_goal_in_capsule(goal.status).then_some(goal)
+    }
+
+    async fn session_transcript_path(&self, thread_id: codex_protocol::ThreadId) -> Option<String> {
+        let thread_manager = self.thread_manager.as_ref()?.upgrade()?;
+        let thread = thread_manager.get_thread(thread_id).await.ok()?;
+        thread.rollout_path().map(|path| path.display().to_string())
     }
 
     fn ensure_background_runtime(&self, thread_store: &ExtensionData) {
@@ -969,7 +1161,8 @@ pub fn install<C: Sync>(registry: &mut ExtensionRegistryBuilder<C>) {
     registry.prompt_contributor(extension.clone());
     registry.turn_item_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension.clone());
-    registry.turn_event_contributor(extension);
+    registry.turn_event_contributor(extension.clone());
+    registry.tool_contributor(extension);
 }
 
 /// Installs the Link context capsule contributor with read access to goal state.
@@ -984,7 +1177,8 @@ pub fn install_with_goal_state<C: Sync>(
     registry.prompt_contributor(extension.clone());
     registry.turn_item_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension.clone());
-    registry.turn_event_contributor(extension);
+    registry.turn_event_contributor(extension.clone());
+    registry.tool_contributor(extension);
 }
 
 /// Installs the Link context contributor with goal state and background callback support.
@@ -1001,6 +1195,7 @@ pub fn install_with_goal_state_and_thread_manager(
     registry.turn_item_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension.clone());
     registry.turn_event_contributor(extension.clone());
+    registry.tool_contributor(extension.clone());
     registry.thread_lifecycle_contributor(extension);
 }
 
@@ -1017,6 +1212,7 @@ pub fn install_with_thread_manager(
     registry.turn_item_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension.clone());
     registry.turn_event_contributor(extension.clone());
+    registry.tool_contributor(extension.clone());
     registry.thread_lifecycle_contributor(extension);
 }
 
@@ -1062,10 +1258,15 @@ fn render_capsule_with_limits(
         &state.files_touched,
         max_field_chars,
     );
+    let evidence_lines: Vec<String> = state
+        .verified_evidence
+        .iter()
+        .map(EvidenceRecord::render)
+        .collect();
     render_list_section(
         &mut out,
         "Verified evidence",
-        &state.verified_evidence,
+        &evidence_lines,
         max_field_chars,
     );
     render_list_section(
@@ -1080,6 +1281,14 @@ fn render_capsule_with_limits(
         &state.open_blockers,
         max_field_chars,
     );
+    if state.session_transcript.is_some() {
+        render_single_section(
+            &mut out,
+            "Session transcript (full history; if the conversation was compacted and a detail is missing, search this file with rg/grep or tail it)",
+            state.session_transcript.as_deref(),
+            max_field_chars,
+        );
+    }
     out.push_str(CAPSULE_END);
 
     if approx_token_count(&out) > max_tokens {
@@ -1177,8 +1386,8 @@ fn format_tool_finish_event(input: &ToolFinishInput<'_>) -> String {
         .unwrap_or_default();
     truncate_chars(
         &format!(
-            "Tool {} {}{} (turn {}, call {}){}",
-            input.tool_name, outcome, source, input.turn_id, input.call_id, output_preview
+            "Tool {} {}{}{}",
+            input.tool_name, outcome, source, output_preview
         ),
         MAX_TOOL_EVENT_CHARS,
     )
@@ -1232,15 +1441,18 @@ fn extract_header_line_suffix(text: &str, prefix: &str) -> Option<String> {
         .and_then(|value| sanitize_value(value, MAX_TOOL_OUTPUT_PREVIEW_CHARS))
 }
 
-fn background_event_steering_item(events: &[BackgroundTriggerEvent]) -> ResponseItem {
-    let body = events
+fn render_background_events(events: &[BackgroundTriggerEvent]) -> String {
+    events
         .iter()
         .map(BackgroundTriggerEvent::render)
         .collect::<Vec<_>>()
-        .join("\n\n");
+        .join("\n\n")
+}
+
+fn background_event_steering_item(events: &[BackgroundTriggerEvent]) -> ResponseItem {
     ContextualUserFragment::into(InternalModelContextFragment::new(
         InternalContextSource::from_static("link_background"),
-        body,
+        render_background_events(events),
     ))
 }
 
@@ -1321,10 +1533,6 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     values.push(value.to_string());
 }
 
-fn push_unique_capped(values: &mut Vec<String>, value: String, max_len: usize) {
-    append_unique_values_with_char_limit(values, &[value], Some(max_len), MAX_TOOL_EVENT_CHARS);
-}
-
 fn append_unique_values(values: &mut Vec<String>, additions: &[String], max_len: Option<usize>) {
     append_unique_values_with_char_limit(values, additions, max_len, usize::MAX);
 }
@@ -1364,8 +1572,10 @@ fn merge_option(target: &mut Option<String>, source: &Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_extension_api::ToolCall;
     use codex_extension_api::ToolCallOutcome;
     use codex_extension_api::ToolCallSource;
+    use codex_extension_api::ToolExecutor;
     use codex_extension_api::ToolFinishInput;
     use codex_extension_api::ToolLifecycleContributor;
     use codex_extension_api::ToolName;
@@ -1401,9 +1611,13 @@ mod tests {
             current_progress: vec!["extension seam selected".to_string()],
             next_action: Some("wire lifecycle evidence".to_string()),
             files_touched: vec!["codex-rs/ext/link-context/src/lib.rs".to_string()],
-            verified_evidence: vec!["unit test covers renderer".to_string()],
+            verified_evidence: vec![EvidenceRecord::host(
+                EvidenceKind::Observation,
+                "unit test covers renderer",
+            )],
             active_background_jobs: vec!["job-17 running train.py".to_string()],
             open_blockers: vec!["none".to_string()],
+            session_transcript: Some("/tmp/rollout.jsonl".to_string()),
         };
 
         let capsule = state
@@ -1436,7 +1650,10 @@ mod tests {
     fn enforces_capsule_token_budget() {
         let state = LinkContextState {
             active_goal: Some("large evidence".to_string()),
-            verified_evidence: vec!["word ".repeat(10_000)],
+            verified_evidence: vec![EvidenceRecord::host(
+                EvidenceKind::Observation,
+                "word ".repeat(10_000),
+            )],
             ..LinkContextState::default()
         };
 
@@ -1535,7 +1752,9 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         let capsule = fragments[0].text();
         assert!(capsule.contains("Next action:\n- run targeted test\n"));
-        assert!(capsule.contains("Verified evidence:\n- Tool exec_command completed successfully"));
+        assert!(capsule.contains(
+            "Verified evidence:\n- [tool, host] Tool exec_command completed successfully"
+        ));
         assert!(capsule.contains("(turn turn-1, call call-1)"));
         assert!(capsule.contains("Output preview: ok: all targeted tests passed"));
     }
@@ -1571,18 +1790,18 @@ mod tests {
         let state = store.snapshot();
 
         assert_eq!(state.verified_evidence.len(), MAX_RECORDED_TOOL_EVENTS);
-        assert!(
-            !state
-                .verified_evidence
-                .iter()
-                .any(|value| value.contains("call-00"))
-        );
-        assert!(
-            state
-                .verified_evidence
-                .iter()
-                .any(|value| value.contains("call-18"))
-        );
+        assert!(!state.verified_evidence.iter().any(|record| {
+            record
+                .source_ref
+                .as_deref()
+                .is_some_and(|r| r.contains("call-00"))
+        }));
+        assert!(state.verified_evidence.iter().any(|record| {
+            record
+                .source_ref
+                .as_deref()
+                .is_some_and(|r| r.contains("call-18"))
+        }));
     }
 
     #[tokio::test]
@@ -1631,9 +1850,17 @@ mod tests {
                 "src/link.rs".to_string()
             ]
         );
+        assert_eq!(state.verified_evidence.len(), 1);
+        let record = &state.verified_evidence[0];
+        assert_eq!(record.kind, EvidenceKind::FileChange);
+        assert_eq!(record.summary, "Patch completed touched 3 file(s)");
         assert_eq!(
-            state.verified_evidence,
-            vec!["Patch completed touched 3 file(s): README.md, src/lib.rs, src/link.rs"]
+            record.related_paths,
+            vec![
+                "README.md".to_string(),
+                "src/lib.rs".to_string(),
+                "src/link.rs".to_string()
+            ]
         );
     }
 
@@ -1680,12 +1907,11 @@ mod tests {
                     .to_string()
             ]
         );
-        assert!(
-            state
-                .verified_evidence
-                .iter()
-                .any(|value| value.contains("Native background exec started: exec session 1234"))
-        );
+        assert!(state.verified_evidence.iter().any(|record| {
+            record
+                .summary
+                .contains("Native background exec started: exec session 1234")
+        }));
     }
 
     #[tokio::test]
@@ -1776,12 +2002,11 @@ mod tests {
                     .to_string()
             ]
         );
-        assert!(
-            state
-                .verified_evidence
-                .iter()
-                .any(|value| value.contains("Native background exec registered: exec session 1234"))
-        );
+        assert!(state.verified_evidence.iter().any(|record| {
+            record
+                .summary
+                .contains("Native background exec registered: exec session 1234")
+        }));
     }
 
     #[tokio::test]
@@ -1921,7 +2146,7 @@ mod tests {
             state
                 .verified_evidence
                 .iter()
-                .any(|value| value.contains("ended with exit_code=0"))
+                .any(|record| record.summary.contains("ended with exit_code=0"))
         );
 
         let events = store.pop_pending_background_events();
@@ -1978,12 +2203,11 @@ mod tests {
             .get::<LinkContextStore>()
             .expect("store should exist");
         let state = store.snapshot();
-        assert!(
-            state
-                .verified_evidence
-                .iter()
-                .any(|value| value.contains("fired trigger `regex:CUDA out of memory`"))
-        );
+        assert!(state.verified_evidence.iter().any(|record| {
+            record
+                .summary
+                .contains("fired trigger `regex:CUDA out of memory`")
+        }));
 
         let events = store.pop_pending_background_events();
         assert_eq!(events.len(), 1);
@@ -2001,6 +2225,315 @@ mod tests {
         assert!(text.contains("Trigger: regex:CUDA out of memory"));
         assert!(text.contains("still running"));
         assert!(text.contains("RuntimeError: CUDA out of memory"));
+    }
+
+    #[test]
+    fn capsule_renders_session_transcript_when_set() {
+        let state = LinkContextState {
+            next_action: Some("resume training".to_string()),
+            session_transcript: Some("/tmp/rollout.jsonl".to_string()),
+            ..LinkContextState::default()
+        };
+        let capsule = state.render_capsule().expect("capsule should render");
+        assert!(capsule.contains("Session transcript"));
+        assert!(capsule.contains("/tmp/rollout.jsonl"));
+    }
+
+    #[test]
+    fn session_transcript_alone_does_not_render_capsule() {
+        let state = LinkContextState {
+            session_transcript: Some("/tmp/rollout.jsonl".to_string()),
+            ..LinkContextState::default()
+        };
+        assert!(state.is_empty());
+        assert_eq!(state.render_capsule(), None);
+    }
+
+    fn background_exec_begin_event() -> ExecCommandBeginEvent {
+        ExecCommandBeginEvent {
+            call_id: "call-bg".to_string(),
+            process_id: Some("1234".to_string()),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 42,
+            command: vec!["python".to_string(), "train.py".to_string()],
+            cwd: PathUri::parse("file:///repo").expect("valid cwd uri"),
+            parsed_cmd: Vec::<ParsedCommand>::new(),
+            source: ExecCommandSource::UnifiedExecStartup,
+            interaction_input: None,
+            background_description: Some("train model until val_loss < 0.30".to_string()),
+            background_triggers: vec!["on_exit".to_string()],
+        }
+    }
+
+    fn sample_background_trigger_event() -> ExecBackgroundTriggerEvent {
+        ExecBackgroundTriggerEvent {
+            call_id: "call-bg".to_string(),
+            process_id: "1234".to_string(),
+            turn_id: "turn-1".to_string(),
+            triggered_at_ms: 42,
+            command: vec!["python".to_string(), "train.py".to_string()],
+            cwd: PathUri::parse("file:///repo").expect("valid cwd uri"),
+            description: Some("train model until val_loss < 0.30".to_string()),
+            declared_triggers: vec!["regex:CUDA out of memory".to_string()],
+            trigger: "regex:CUDA out of memory".to_string(),
+            reason: "regex pattern matched process output".to_string(),
+            output_tail: "RuntimeError: CUDA out of memory".to_string(),
+        }
+    }
+
+    fn record_tool_call(kind: &str, summary: &str) -> ToolCall {
+        ToolCall {
+            turn_id: "turn-1".to_string(),
+            call_id: "call-1".to_string(),
+            tool_name: ToolName::plain(RECORD_LINK_CONTEXT_TOOL_NAME),
+            model: "gpt-test".to_string(),
+            truncation_policy: TruncationPolicy::Bytes(1024),
+            conversation_history: codex_extension_api::ConversationHistory::default(),
+            turn_item_emitter: Arc::new(codex_extension_api::NoopTurnItemEmitter),
+            environments: Vec::new(),
+            payload: codex_extension_api::ToolPayload::Function {
+                arguments: serde_json::json!({ "kind": kind, "summary": summary }).to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn record_link_context_tool_records_typed_evidence() {
+        let store = Arc::new(LinkContextStore::default());
+        let tool = RecordLinkContextTool::new(Arc::clone(&store));
+
+        tool.handle(record_tool_call(
+            "decision",
+            "Chose JSON sidecar over SQLite for Link persistence",
+        ))
+        .await
+        .expect("decision should be recorded");
+        tool.handle(record_tool_call("plan_update", "wire capsule tool tests"))
+            .await
+            .expect("plan update should be recorded");
+        tool.handle(record_tool_call("blocker", "goals db is locked"))
+            .await
+            .expect("blocker should be recorded");
+
+        let state = store.snapshot();
+        assert_eq!(state.verified_evidence.len(), 3);
+        let decision = &state.verified_evidence[0];
+        assert_eq!(decision.kind, EvidenceKind::Decision);
+        assert_eq!(decision.source, EvidenceSource::ModelReported);
+        assert_eq!(
+            decision.source_ref.as_deref(),
+            Some("turn turn-1, call call-1")
+        );
+        assert_eq!(
+            state.next_action,
+            Some("wire capsule tool tests".to_string())
+        );
+        assert_eq!(state.open_blockers, vec!["goals db is locked".to_string()]);
+
+        let capsule = state.render_capsule().expect("capsule should render");
+        assert!(
+            capsule
+                .contains("[decision, model] Chose JSON sidecar over SQLite for Link persistence")
+        );
+    }
+
+    #[tokio::test]
+    async fn record_link_context_tool_rejects_empty_summary() {
+        let store = Arc::new(LinkContextStore::default());
+        let tool = RecordLinkContextTool::new(Arc::clone(&store));
+        let result = tool.handle(record_tool_call("observation", "   ")).await;
+        assert!(result.is_err());
+        assert!(store.snapshot().verified_evidence.is_empty());
+    }
+
+    #[test]
+    fn restored_evidence_is_marked_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("thread-1.json");
+
+        let store = LinkContextStore::default();
+        store.attach_persistence(path.clone());
+        store.update(|state| {
+            push_evidence(
+                &mut state.verified_evidence,
+                EvidenceRecord::model(EvidenceKind::Decision, "use bf16 for the ablation"),
+                MAX_RECORDED_TOOL_EVENTS,
+            );
+        });
+
+        let restored = LinkContextStore::default();
+        restored.attach_persistence(path);
+        let state = restored.snapshot();
+        assert_eq!(state.verified_evidence.len(), 1);
+        assert!(state.verified_evidence[0].stale);
+        let capsule = state.render_capsule().expect("capsule should render");
+        assert!(capsule.contains("[decision, model, stale] use bf16 for the ablation"));
+    }
+
+    #[test]
+    fn persistence_roundtrips_state_and_pending_events_across_stores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("thread-1.json");
+
+        let store = LinkContextStore::default();
+        store.attach_persistence(path.clone());
+        store.update(|state| state.next_action = Some("resume training".to_string()));
+        store.record_turn_event(&EventMsg::ExecBackgroundTrigger(Box::new(
+            sample_background_trigger_event(),
+        )));
+        assert!(path.exists());
+
+        // A fresh store simulates the same thread after a process restart.
+        let restored = LinkContextStore::default();
+        restored.attach_persistence(path);
+        assert_eq!(
+            restored.snapshot().next_action,
+            Some("resume training".to_string())
+        );
+        let events = restored.pop_pending_background_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].trigger, "regex:CUDA out of memory");
+    }
+
+    #[test]
+    fn restored_background_jobs_add_liveness_warning_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("thread-1.json");
+
+        let store = LinkContextStore::default();
+        store.attach_persistence(path.clone());
+        store.record_turn_event(&EventMsg::ExecCommandBegin(background_exec_begin_event()));
+        assert!(!store.snapshot().active_background_jobs.is_empty());
+
+        let restored = LinkContextStore::default();
+        restored.attach_persistence(path);
+        let state = restored.snapshot();
+        assert!(!state.active_background_jobs.is_empty());
+        assert!(
+            state
+                .verified_evidence
+                .iter()
+                .any(|record| record.summary.contains("liveness has not been re-verified"))
+        );
+    }
+
+    #[test]
+    fn delivered_events_are_not_resurrected_after_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("thread-1.json");
+
+        let store = LinkContextStore::default();
+        store.attach_persistence(path.clone());
+        store.record_turn_event(&EventMsg::ExecBackgroundTrigger(Box::new(
+            sample_background_trigger_event(),
+        )));
+        assert_eq!(store.pop_pending_background_events().len(), 1);
+
+        // Same trigger fires again after a restart: the persisted dedup key
+        // ring must prevent a duplicate callback.
+        let restored = LinkContextStore::default();
+        restored.attach_persistence(path);
+        restored.record_turn_event(&EventMsg::ExecBackgroundTrigger(Box::new(
+            sample_background_trigger_event(),
+        )));
+        assert!(restored.pop_pending_background_events().is_empty());
+    }
+
+    #[test]
+    fn corrupt_persistence_file_degrades_to_empty_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("thread-1.json");
+        std::fs::write(&path, b"not json").expect("write corrupt file");
+
+        let store = LinkContextStore::default();
+        store.attach_persistence(path.clone());
+        assert_eq!(store.snapshot(), LinkContextState::default());
+
+        // The store stays usable and overwrites the corrupt file on the next
+        // mutation.
+        store.update(|state| state.next_action = Some("recovered".to_string()));
+        let restored = LinkContextStore::default();
+        restored.attach_persistence(path);
+        assert_eq!(
+            restored.snapshot().next_action,
+            Some("recovered".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn contribute_turn_context_drains_pending_background_events() {
+        let contributor = LinkContextExtension::default();
+        let session_store = ExtensionData::new("session");
+        let thread_store = ExtensionData::new("thread");
+        let turn_store = ExtensionData::new("turn");
+
+        let trigger_event = ExecBackgroundTriggerEvent {
+            call_id: "call-bg".to_string(),
+            process_id: "1234".to_string(),
+            turn_id: "turn-1".to_string(),
+            triggered_at_ms: 42,
+            command: vec!["python".to_string(), "train.py".to_string()],
+            cwd: PathUri::parse("file:///repo").expect("valid cwd uri"),
+            description: Some("train model until val_loss < 0.30".to_string()),
+            declared_triggers: vec!["regex:CUDA out of memory".to_string()],
+            trigger: "regex:CUDA out of memory".to_string(),
+            reason: "regex pattern matched process output".to_string(),
+            output_tail: "RuntimeError: CUDA out of memory".to_string(),
+        };
+        contributor
+            .on_turn_event(TurnEventInput {
+                session_store: &session_store,
+                thread_store: &thread_store,
+                turn_store: &turn_store,
+                turn_id: "turn-1",
+                event: &EventMsg::ExecBackgroundTrigger(Box::new(trigger_event)),
+            })
+            .await;
+
+        let fragments = contributor
+            .contribute_turn_context(TurnContextContributionInput {
+                thread_id: codex_protocol::ThreadId::default(),
+                turn_id: "turn-2",
+                session_store: &session_store,
+                thread_store: &thread_store,
+                turn_store: &turn_store,
+                model_context_window: Some(200_000),
+            })
+            .await;
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[1].slot(), PromptSlot::ContextualUser);
+        assert!(
+            fragments[1]
+                .text()
+                .contains("<codex_link_background_event>")
+        );
+        assert!(
+            fragments[1]
+                .text()
+                .contains("Trigger: regex:CUDA out of memory")
+        );
+
+        let store = thread_store
+            .get::<LinkContextStore>()
+            .expect("store should exist");
+        assert!(store.pop_pending_background_events().is_empty());
+
+        let fragments = contributor
+            .contribute_turn_context(TurnContextContributionInput {
+                thread_id: codex_protocol::ThreadId::default(),
+                turn_id: "turn-3",
+                session_store: &session_store,
+                thread_store: &thread_store,
+                turn_store: &turn_store,
+                model_context_window: Some(200_000),
+            })
+            .await;
+        assert_eq!(fragments.len(), 1);
+        assert!(
+            !fragments[0]
+                .text()
+                .contains("<codex_link_background_event>")
+        );
     }
 
     #[tokio::test]
@@ -2299,6 +2832,6 @@ mod tests {
         assert_eq!(registry.turn_item_contributors().len(), 1);
         assert_eq!(registry.tool_lifecycle_contributors().len(), 1);
         assert_eq!(registry.turn_event_contributors().len(), 1);
-        assert_eq!(registry.tool_contributors().len(), 0);
+        assert_eq!(registry.tool_contributors().len(), 1);
     }
 }

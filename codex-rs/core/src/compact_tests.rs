@@ -404,7 +404,10 @@ async fn process_compacted_history_reinjects_link_context_capsule() {
         .insert(codex_link_context_extension::LinkContextState {
             active_goal: Some("compact must preserve Link state".to_string()),
             next_action: Some("continue with the task ledger".to_string()),
-            verified_evidence: vec!["capsule comes from extension state".to_string()],
+            verified_evidence: vec![codex_link_context_extension::EvidenceRecord::host(
+                codex_link_context_extension::EvidenceKind::Observation,
+                "capsule comes from extension state",
+            )],
             ..codex_link_context_extension::LinkContextState::default()
         });
     let turn_context = Arc::new(turn_context);

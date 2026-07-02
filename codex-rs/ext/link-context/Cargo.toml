@@ -17,6 +17,7 @@ codex-core = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-protocol = { workspace = true }
 codex-state = { workspace = true }
+codex-tools = { workspace = true }
 codex-utils-output-truncation = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -25,4 +26,5 @@ tracing = { workspace = true, features = ["log"] }
 [dev-dependencies]
 codex-utils-path-uri = { workspace = true }
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

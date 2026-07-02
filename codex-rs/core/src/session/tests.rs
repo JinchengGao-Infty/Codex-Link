@@ -8385,7 +8385,10 @@ async fn record_context_updates_reinjects_link_context_capsule_on_steady_state_t
         .thread_extension_data
         .insert(codex_link_context_extension::LinkContextState {
             active_goal: Some("survive compact rewrite".to_string()),
-            verified_evidence: vec!["thread store still owns the capsule state".to_string()],
+            verified_evidence: vec![codex_link_context_extension::EvidenceRecord::host(
+                codex_link_context_extension::EvidenceKind::Observation,
+                "thread store still owns the capsule state",
+            )],
             ..codex_link_context_extension::LinkContextState::default()
         });
     let mut previous_context_item = turn_context.to_turn_context_item();
