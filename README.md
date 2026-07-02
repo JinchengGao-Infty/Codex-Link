@@ -1,88 +1,171 @@
-<p align="center"><strong>Codex-Link</strong> is an independent, Apache-2.0 community fork of OpenAI Codex CLI.</p>
+<p align="center"><strong>Codex-Link</strong></p>
 
-Codex-Link tracks the upstream OpenAI Codex CLI codebase while developing a
-more open fork workflow, local-first reliability fixes, clearer diagnostics,
-and extension surfaces that can move without waiting for invitation-only
-upstream contribution review.
-
-- Fork notes and roadmap: [docs/link-fork.md](./docs/link-fork.md)
-- Local development workflow: [docs/link-development.md](./docs/link-development.md)
-- Upstream baseline at fork creation:
-  `openai/codex@db887d03e1 fix(core) Remove full text websocket trace (#30757)`
-
-Codex-Link preserves the upstream Apache-2.0 license, NOTICE file, and original
-project attribution. The original upstream README starts below.
-
----
-
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
+  An independent Apache-2.0 community fork of OpenAI Codex CLI, focused on
+  local runtime reliability, compact-survivable context, and event-driven
+  background work.
 </p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
 
----
+<p align="center">
+  <a href="#english">English</a> · <a href="#中文">中文</a>
+</p>
 
-## Quickstart
+> Codex-Link is not an official OpenAI product. It is derived from
+> [OpenAI Codex CLI](https://github.com/openai/codex) and preserves the
+> upstream Apache-2.0 license, NOTICE attribution, and repository history.
 
-### Installing and running Codex CLI
+## English
 
-Run the following on Mac or Linux to install Codex CLI:
+Codex-Link tracks upstream OpenAI Codex CLI while experimenting with a more
+local-first agent runtime. The fork keeps upstream history intact so changes can
+be audited and merged forward, but it develops under its own public workflow and
+uses its own distribution names.
+
+The default local binary name used by this fork is `codel`. Do not publish
+Codex-Link binaries or npm packages under upstream `@openai/*` names.
+
+### Current Focus
+
+- **Link Context Engine**: a structured context capsule that survives compact
+  summaries and keeps active goals, progress, evidence, files, blockers, and
+  jobs model-visible with bounded size.
+- **Link Job Store**: local tracking for long-running commands, completed jobs,
+  logs, and trigger events.
+- **Event-driven background work**: background commands wake the model only on
+  declared triggers such as `on_exit`, regex matches, metric thresholds, or
+  plateau conditions. Long jobs should not be supervised by repeated model
+  polling.
+- **Local observation tools**: `job_observe` and `job_cancel` expose job state
+  without forcing a reasoning loop.
+- **Typed, triggerable rules**: Link rules can be loaded from disk each turn and
+  selected by scope instead of being permanently stuffed into prompt context.
+- **Compact survival**: compact summaries point back to full transcript and
+  sidecar evidence rather than forcing the model to reconstruct state from a
+  natural-language summary alone.
+
+### Status
+
+This fork is experimental and self-use first. It is suitable for local
+development and architecture experiments. Treat public releases as unstable
+until release artifacts, signatures, and compatibility notes are published.
+
+### Build From Source
+
+Requirements follow the upstream Rust workspace. A typical local build is:
 
 ```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+git clone https://github.com/JinchengGao-Infty/Codex-Link.git
+cd Codex-Link/codex-rs
+cargo build -p codex-cli --bin codex
+install -m 755 target/debug/codex ~/.local/bin/codel
 ```
 
-Run the following on Windows to install Codex CLI:
-
-```
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
-
-Codex CLI can also be installed via the following package managers:
+Then start the forked CLI with:
 
 ```shell
-# Install using npm
-npm install -g @openai/codex
+codel
 ```
+
+For upstream build details, see [docs/install.md](./docs/install.md).
+
+### Documentation
+
+- [Fork notes and roadmap](./docs/link-fork.md)
+- [Local development workflow](./docs/link-development.md)
+- [Upstream Codex documentation](https://developers.openai.com/codex)
+- [Upstream contributing notes](./docs/contributing.md)
+
+### License And Attribution
+
+Codex-Link is distributed under the [Apache License 2.0](./LICENSE), the same
+license used by upstream OpenAI Codex CLI.
+
+When redistributing source or binaries:
+
+- keep the `LICENSE` file;
+- keep the upstream and Codex-Link entries in `NOTICE`;
+- preserve OpenAI Codex CLI attribution;
+- clearly mark Codex-Link as an independent fork;
+- do not imply OpenAI endorsement;
+- do not publish fork packages under upstream `@openai/*` names.
+
+Upstream baseline at fork creation:
+
+```text
+openai/codex@db887d03e1 fix(core) Remove full text websocket trace (#30757)
+```
+
+## 中文
+
+Codex-Link 是 OpenAI Codex CLI 的独立 Apache-2.0 社区分支，目标不是简单改
+prompt，而是把 Codex CLI 改造成更可靠的本地 agent runtime：上下文可以跨
+compact 存活，后台任务由本地事件驱动，长输出和证据进入 sidecar，而不是靠模型
+反复轮询或从自然语言摘要里猜状态。
+
+本分支默认使用本地二进制名 `codel`。不要以 OpenAI 上游的 `@openai/*`
+包名发布 Codex-Link。
+
+### 当前重点
+
+- **Link Context Engine**：结构化上下文胶囊，保存 active goal、进度、证据、
+  文件、阻塞项和后台任务，并以有限 token 注入模型上下文。
+- **Link Job Store**：本地记录长任务、已完成任务、日志和 trigger 事件。
+- **事件驱动后台任务**：后台命令只在 `on_exit`、regex、metric threshold、
+  plateau 等 trigger 命中时唤醒模型，不靠模型反复轮询。
+- **本地观察工具**：通过 `job_observe` / `job_cancel` 查看或取消任务，避免把
+  状态检查变成推理循环。
+- **类型化规则系统**：Link rules 每轮可从磁盘重载，并按 scope/trigger 选择，
+  不再把所有规则永久塞进 prompt。
+- **compact survival**：compact 摘要保留对完整 transcript 和 sidecar 证据的
+  引用，避免模型只靠一段自然语言 summary 恢复任务状态。
+
+### 状态
+
+本项目目前是实验性、自用优先的 fork。可以用于本地开发和架构验证；在正式
+release、签名和兼容性说明完善前，请把公开构建视为不稳定版本。
+
+### 从源码构建
+
+Rust workspace 的依赖基本沿用上游。一个常见本地构建流程是：
 
 ```shell
-# Install using Homebrew
-brew install --cask codex
+git clone https://github.com/JinchengGao-Infty/Codex-Link.git
+cd Codex-Link/codex-rs
+cargo build -p codex-cli --bin codex
+install -m 755 target/debug/codex ~/.local/bin/codel
 ```
 
-Then simply run `codex` to get started.
+然后运行：
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+```shell
+codel
+```
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+上游构建说明见 [docs/install.md](./docs/install.md)。
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+### 文档
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+- [Fork 说明和路线图](./docs/link-fork.md)
+- [本地开发流程](./docs/link-development.md)
+- [OpenAI Codex 上游文档](https://developers.openai.com/codex)
+- [上游贡献说明](./docs/contributing.md)
 
-</details>
+### 许可和归属
 
-### Using Codex with your ChatGPT plan
+Codex-Link 继续使用上游 OpenAI Codex CLI 的
+[Apache License 2.0](./LICENSE)。
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
+分发源码或二进制时请遵守：
 
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
+- 保留 `LICENSE`;
+- 保留 `NOTICE` 中的上游和 Codex-Link 归属说明;
+- 明确说明本项目派生自 OpenAI Codex CLI;
+- 明确说明 Codex-Link 是独立社区 fork，不是 OpenAI 官方产品;
+- 不暗示 OpenAI 背书;
+- 不使用上游 `@openai/*` 包名发布本分支。
 
-## Docs
+Fork 创建时的上游基线：
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+```text
+openai/codex@db887d03e1 fix(core) Remove full text websocket trace (#30757)
+```
