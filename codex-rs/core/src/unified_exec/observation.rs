@@ -1,0 +1,100 @@
+//! Local observation primitives for unified-exec sessions.
+//!
+//! These back the model-facing `job_observe` / `job_cancel` tools. Everything
+//! here runs in the harness: waiting for a process to exit blocks a tool call
+//! on the process cancellation token, not a model reasoning loop, so watching
+//! a long job costs zero inference between state changes.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use codex_utils_path_uri::PathUri;
+use tokio_util::sync::CancellationToken;
+
+use super::UnifiedExecProcess;
+use super::UnifiedExecProcessManager;
+
+/// Point-in-time view of one tracked session. Exited sessions vanish from the
+/// manager when reaped, so absence of a snapshot does not mean the job never
+/// existed — its durable log outlives it.
+#[derive(Clone, Debug)]
+pub(crate) struct JobSnapshot {
+    pub(crate) process_id: i32,
+    pub(crate) command: String,
+    pub(crate) cwd: PathUri,
+    pub(crate) background_description: Option<String>,
+    pub(crate) background_triggers: Vec<String>,
+    pub(crate) running: bool,
+    pub(crate) exit_code: Option<i32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JobWaitOutcome {
+    Exited { exit_code: Option<i32> },
+    TimedOut,
+    Interrupted,
+    Unknown,
+}
+
+impl UnifiedExecProcessManager {
+    pub(crate) async fn job_snapshots(&self) -> Vec<JobSnapshot> {
+        let store = self.process_store.lock().await;
+        let mut snapshots: Vec<JobSnapshot> =
+            store.processes.values().map(snapshot_entry).collect();
+        snapshots.sort_by_key(|snapshot| snapshot.process_id);
+        snapshots
+    }
+
+    pub(crate) async fn job_snapshot(&self, process_id: i32) -> Option<JobSnapshot> {
+        let store = self.process_store.lock().await;
+        store.processes.get(&process_id).map(snapshot_entry)
+    }
+
+    /// Blocks until the session exits, `timeout` elapses, or the tool call is
+    /// interrupted — whichever comes first. Returns `Unknown` when no session
+    /// with that id is tracked (never started, or already reaped).
+    pub(crate) async fn wait_for_exit(
+        &self,
+        process_id: i32,
+        timeout: Duration,
+        interrupt: &CancellationToken,
+    ) -> JobWaitOutcome {
+        let process: Arc<UnifiedExecProcess> = {
+            let store = self.process_store.lock().await;
+            match store.processes.get(&process_id) {
+                Some(entry) => Arc::clone(&entry.process),
+                None => return JobWaitOutcome::Unknown,
+            }
+        };
+
+        if !process.has_exited() {
+            let exit_token = process.cancellation_token();
+            tokio::select! {
+                _ = exit_token.cancelled() => {}
+                _ = interrupt.cancelled() => return JobWaitOutcome::Interrupted,
+                _ = tokio::time::sleep(timeout) => return JobWaitOutcome::TimedOut,
+            }
+        }
+
+        // The cancellation token fires at exit, slightly before the exit code
+        // is recorded; give the reaper a moment before reading it.
+        let mut exit_code = process.exit_code();
+        if exit_code.is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            exit_code = process.exit_code();
+        }
+        JobWaitOutcome::Exited { exit_code }
+    }
+}
+
+fn snapshot_entry(entry: &super::ProcessEntry) -> JobSnapshot {
+    JobSnapshot {
+        process_id: entry.process_id,
+        command: entry.hook_command.clone(),
+        cwd: entry.cwd.clone(),
+        background_description: entry.background_description.clone(),
+        background_triggers: entry.background_triggers.clone(),
+        running: !entry.process.has_exited(),
+        exit_code: entry.process.exit_code(),
+    }
+}

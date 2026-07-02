@@ -13,6 +13,8 @@ use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::GetContextRemainingHandler;
+use crate::tools::handlers::JobCancelHandler;
+use crate::tools::handlers::JobObserveHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
@@ -667,6 +669,10 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
                 ),
             }));
             planned_tools.add(WriteStdinHandler);
+            // Local job observation replaces empty-write_stdin polling for
+            // watching background sessions.
+            planned_tools.add(JobObserveHandler);
+            planned_tools.add(JobCancelHandler);
 
             // Keep the legacy shell tool registered while unified exec is
             // model-visible.

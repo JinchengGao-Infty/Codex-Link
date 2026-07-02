@@ -251,15 +251,11 @@ impl ExecCommandHandler {
             }
         }
         let process_id = manager.allocate_process_id().await;
-        let background_log_path = context
-            .turn
-            .config
-            .codex_home
-            .join("link")
-            .join("jobs")
-            .join(context.session.thread_id.to_string())
-            .join(format!("exec-{process_id}.log"))
-            .to_path_buf();
+        let background_log_path = crate::unified_exec::background_log_path(
+            &context.turn.config.codex_home,
+            context.session.thread_id,
+            process_id,
+        );
         let resolved_command = get_command(
             &args,
             shell,

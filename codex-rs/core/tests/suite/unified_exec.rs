@@ -3641,3 +3641,104 @@ fn assert_command(command: &[String], expected_args: &str, expected_cmd: &str) {
     assert_eq!(command[1], expected_args);
     assert_eq!(command[2], expected_cmd);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_observe_wait_reports_exit_code_and_log_tail() -> Result<()> {
+    // TODO(anp): Remove after unified-exec fixtures use target-native commands.
+    skip_if_target_windows!(Ok(()), "uses a POSIX-only command fixture");
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let start_call_id = "uexec-job-observe-start";
+    // Short yield leaves the process running so the model gets a session id
+    // back and can observe it with `job_observe` instead of polling.
+    let start_args = json!({
+        "cmd": "sleep 2; printf 'JOB-OBSERVE-DONE\\n'",
+        "yield_time_ms": 500,
+    });
+    let wait_call_id = "job-observe-wait";
+    let wait_args = json!({
+        "action": "wait",
+        "session_id": 1000,
+        "timeout_ms": 30_000,
+    });
+
+    let responses = vec![
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(
+                start_call_id,
+                "exec_command",
+                &serde_json::to_string(&start_args)?,
+            ),
+            ev_completed("resp-1"),
+        ]),
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_function_call(
+                wait_call_id,
+                "job_observe",
+                &serde_json::to_string(&wait_args)?,
+            ),
+            ev_completed("resp-2"),
+        ]),
+        sse(vec![
+            ev_response_created("resp-3"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-3"),
+        ]),
+    ];
+    mount_sse_sequence(&server, responses).await;
+
+    submit_unified_exec_turn(
+        &test,
+        "watch a background job without polling",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let start_output = wait_for_raw_unified_exec_output(&test, start_call_id).await?;
+    assert_eq!(
+        start_output.process_id.as_deref(),
+        Some("1000"),
+        "start command should leave a running session with a deterministic id"
+    );
+
+    let wait_output = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RawResponseItem(raw) => match &raw.item {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if call_id == wait_call_id => output.text_content().map(str::to_string),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        wait_output.contains("session 1000 exited with code 0"),
+        "wait should block until exit and report the exit code: {wait_output}"
+    );
+    assert!(
+        wait_output.contains("JOB-OBSERVE-DONE"),
+        "wait result should include the durable log tail: {wait_output}"
+    );
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    Ok(())
+}

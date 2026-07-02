@@ -165,7 +165,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "write_stdin".to_string(),
-        description: "Writes characters to an existing unified exec session. With empty chars, performs one local wait/status check for output or completion; do not use it as a repeated background polling loop.".to_string(),
+        description: "Writes characters to an existing unified exec session. With empty chars, performs one local wait/status check for output or completion; do not use it as a repeated background polling loop — use `job_observe` (wait/tail/status) to watch a session instead.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(

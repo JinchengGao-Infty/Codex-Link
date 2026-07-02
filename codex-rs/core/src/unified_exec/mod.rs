@@ -49,9 +49,28 @@ mod background_output_log;
 mod background_triggers;
 mod errors;
 mod head_tail_buffer;
+mod observation;
 mod process;
 mod process_manager;
 mod process_state;
+
+pub(crate) use observation::JobSnapshot;
+pub(crate) use observation::JobWaitOutcome;
+
+/// Durable append-only log for a unified-exec session. Every session writes
+/// one, and it outlives the process, so observation tools use it as the
+/// ground-truth output archive for live and dead jobs alike.
+pub(crate) fn background_log_path(
+    codex_home: &std::path::Path,
+    thread_id: codex_protocol::ThreadId,
+    process_id: i32,
+) -> PathBuf {
+    codex_home
+        .join("link")
+        .join("jobs")
+        .join(thread_id.to_string())
+        .join(format!("exec-{process_id}.log"))
+}
 
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
