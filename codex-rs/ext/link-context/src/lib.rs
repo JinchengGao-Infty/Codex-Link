@@ -1021,10 +1021,11 @@ impl ContextContributor for LinkContextExtension {
                 }
             }
             // Typed rules: always-apply and glob-activated bodies plus a
-            // bounded index of the rest. Renders per turn because the
-            // matched set grows with the session's touched files.
+            // bounded index of the rest. Re-read from disk per turn so rule
+            // edits apply mid-session, and re-rendered because the matched
+            // set grows with the session's touched files.
             if let Some(rules) = input.thread_store.get::<rules::LinkRules>()
-                && let Some(rendered) = rules.render(&state.files_touched)
+                && let Some(rendered) = rules.reload().render(&state.files_touched)
             {
                 fragments.push(PromptFragment::new(PromptSlot::ContextualUser, rendered));
             }
@@ -1040,8 +1041,8 @@ impl ThreadLifecycleContributor<codex_core::config::Config> for LinkContextExten
     ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             self.ensure_background_runtime(input.thread_store);
-            // Typed rules load once per thread start; they are static files,
-            // so no re-scan happens mid-thread.
+            // Typed rules: the stored value carries the source directories;
+            // each turn re-reads them so mid-session edits take effect.
             input.thread_store.insert(rules::LinkRules::load(
                 input.config.cwd.as_path(),
                 &input.config.codex_home,
@@ -2513,17 +2514,23 @@ mod tests {
         let thread_store = ExtensionData::new("thread");
         let turn_store = ExtensionData::new("turn");
 
-        thread_store.insert(rules::LinkRules {
-            project_root: std::path::PathBuf::from("/project"),
-            rules: vec![rules::LinkRule {
-                name: "base".to_string(),
-                path: std::path::PathBuf::from("/project/.codex/rules/base.md"),
-                description: None,
-                globs: Vec::new(),
-                always_apply: true,
-                body: "Prefer small modules.".to_string(),
-            }],
-        });
+        let project = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let rules_dir = project.path().join(".codex").join("rules");
+        std::fs::create_dir_all(&rules_dir).expect("create rules dir");
+        std::fs::write(
+            rules_dir.join("base.md"),
+            "---\nalways_apply: true\n---\nPrefer small modules.",
+        )
+        .expect("write rule");
+        thread_store.insert(rules::LinkRules::load(project.path(), codex_home.path()));
+
+        // Written after the store snapshot: only visible via per-turn reload.
+        std::fs::write(
+            rules_dir.join("late.md"),
+            "---\ndescription: Added mid-session\n---\nLate body.",
+        )
+        .expect("write rule");
 
         let fragments = contributor
             .contribute_turn_context(TurnContextContributionInput {
@@ -2542,6 +2549,7 @@ mod tests {
         assert_eq!(rules_fragment.slot(), PromptSlot::ContextualUser);
         assert!(rules_fragment.text().contains("[always] base"));
         assert!(rules_fragment.text().contains("Prefer small modules."));
+        assert!(rules_fragment.text().contains("- late — Added mid-session"));
     }
 
     #[tokio::test]

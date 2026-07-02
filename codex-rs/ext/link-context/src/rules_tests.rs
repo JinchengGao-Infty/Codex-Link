@@ -94,6 +94,39 @@ fn renders_always_glob_and_index_classes() {
 }
 
 #[test]
+fn reload_picks_up_edits_additions_and_deletions() {
+    let project = tempfile::tempdir().expect("tempdir");
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let rules_dir = project.path().join(".codex").join("rules");
+    write_rule(
+        &rules_dir,
+        "base.md",
+        "---\nalways_apply: true\n---\nOld body.",
+    );
+    let rules = LinkRules::load(project.path(), codex_home.path());
+    assert!(rules.render(&[]).expect("render").contains("Old body."));
+
+    write_rule(
+        &rules_dir,
+        "base.md",
+        "---\nalways_apply: true\n---\nNew body.",
+    );
+    write_rule(
+        &rules_dir,
+        "extra.md",
+        "---\nalways_apply: true\n---\nExtra.",
+    );
+    let rendered = rules.reload().render(&[]).expect("render");
+    assert!(rendered.contains("New body."));
+    assert!(!rendered.contains("Old body."));
+    assert!(rendered.contains("Extra."));
+
+    std::fs::remove_file(rules_dir.join("base.md")).expect("remove rule");
+    std::fs::remove_file(rules_dir.join("extra.md")).expect("remove rule");
+    assert_eq!(rules.reload().render(&[]), None);
+}
+
+#[test]
 fn no_rules_renders_nothing() {
     let project = tempfile::tempdir().expect("tempdir");
     let codex_home = tempfile::tempdir().expect("tempdir");
@@ -127,6 +160,7 @@ fn rule_bodies_cannot_fake_the_fragment_boundary() {
     );
     let rules = LinkRules {
         project_root: Path::new("/project").to_path_buf(),
+        codex_home: Path::new("/codex-home").to_path_buf(),
         rules: vec![rule],
     };
     let rendered = rules.render(&[]).expect("rules should render");

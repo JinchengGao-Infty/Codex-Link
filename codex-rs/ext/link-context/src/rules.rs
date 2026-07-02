@@ -1,9 +1,10 @@
 //! Typed, triggerable rules for Link context injection.
 //!
 //! Rules are markdown files with a small frontmatter header, loaded from
-//! `<cwd>/.codex/rules/` (project) and `<codex_home>/rules/` (user) at thread
-//! start. The frontmatter decides the rule's context class instead of dumping
-//! every rule into the prompt:
+//! `<cwd>/.codex/rules/` (project) and `<codex_home>/rules/` (user). They are
+//! re-read from disk each turn, so edits apply without restarting the thread.
+//! The frontmatter decides the rule's context class instead of dumping every
+//! rule into the prompt:
 //!
 //! - `always_apply: true` — body injected every turn.
 //! - `globs: src/**/*.rs, tests/**` — body injected once a file touched this
@@ -82,6 +83,7 @@ impl LinkRule {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LinkRules {
     pub(crate) project_root: PathBuf,
+    pub(crate) codex_home: PathBuf,
     pub(crate) rules: Vec<LinkRule>,
 }
 
@@ -99,8 +101,16 @@ impl LinkRules {
         }
         Self {
             project_root: project_root.to_path_buf(),
+            codex_home: codex_home.to_path_buf(),
             rules,
         }
+    }
+
+    /// Re-reads the rule directories so mid-session edits, additions, and
+    /// deletions take effect on the next turn. The directories are small
+    /// (bounded per source), so a fresh scan per turn is cheap.
+    pub(crate) fn reload(&self) -> Self {
+        Self::load(&self.project_root, &self.codex_home)
     }
 
     /// Renders the bounded rules fragment for the current turn, or `None`
@@ -248,10 +258,9 @@ fn parse_rule_file(path: &Path, contents: &str) -> LinkRule {
             };
             let value = value.trim();
             match key.trim() {
-                "description"
-                    if !value.is_empty() => {
-                        rule.description = Some(value.to_string());
-                    }
+                "description" if !value.is_empty() => {
+                    rule.description = Some(value.to_string());
+                }
                 "globs" => {
                     rule.globs = value
                         .split(',')
