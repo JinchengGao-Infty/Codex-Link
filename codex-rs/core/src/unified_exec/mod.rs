@@ -167,6 +167,10 @@ impl ProcessStore {
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Mutex<ProcessStore>,
     max_write_stdin_yield_time_ms: u64,
+    /// Bounded archive of reaped sessions so observation tools can still
+    /// answer status/wait queries (exit code included) after an entry leaves
+    /// the live store. Std mutex: critical sections are short and sync.
+    completed_jobs: std::sync::Mutex<std::collections::VecDeque<JobSnapshot>>,
 }
 
 impl UnifiedExecProcessManager {
@@ -175,6 +179,7 @@ impl UnifiedExecProcessManager {
             process_store: Mutex::new(ProcessStore::default()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
+            completed_jobs: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 }

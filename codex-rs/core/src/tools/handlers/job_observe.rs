@@ -38,6 +38,7 @@ const MAX_READ_LIMIT_BYTES: u64 = 16_384;
 /// Upper bound on bytes pulled from a log to extract a line tail.
 const TAIL_SCAN_BYTES: u64 = 64 * 1024;
 const WAIT_RESULT_TAIL_LINES: usize = 20;
+const RECENT_COMPLETED_IN_LIST: usize = 8;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -114,14 +115,20 @@ async fn handle_observe(
     let manager = &invocation.session.services.unified_exec_manager;
 
     let text = match args.action {
-        JobObserveAction::List => render_list(manager.job_snapshots().await, &invocation),
+        JobObserveAction::List => render_list(
+            manager.job_snapshots().await,
+            manager.recent_completed_jobs(RECENT_COMPLETED_IN_LIST),
+            &invocation,
+        ),
         JobObserveAction::Status => {
             let session_id = require_session_id(&args)?;
-            render_status(
-                manager.job_snapshot(session_id).await,
-                session_id,
-                &invocation,
-            )
+            // Live entry first; reaped sessions resolve through the completed
+            // archive so their exit codes stay answerable.
+            let snapshot = match manager.job_snapshot(session_id).await {
+                Some(snapshot) => Some(snapshot),
+                None => manager.completed_job(session_id),
+            };
+            render_status(snapshot, session_id, &invocation)
         }
         JobObserveAction::Tail => {
             let session_id = require_session_id(&args)?;
@@ -228,13 +235,27 @@ fn job_log_path(invocation: &ToolInvocation, session_id: i32) -> std::path::Path
     )
 }
 
-fn render_list(snapshots: Vec<JobSnapshot>, invocation: &ToolInvocation) -> String {
+fn render_list(
+    snapshots: Vec<JobSnapshot>,
+    completed: Vec<JobSnapshot>,
+    invocation: &ToolInvocation,
+) -> String {
+    let mut lines = Vec::new();
     if snapshots.is_empty() {
-        return "No live exec sessions. Finished sessions leave durable logs; use `status`, `tail`, or `read` with a session_id to inspect one.".to_string();
+        lines.push(
+            "No live exec sessions. Finished sessions leave durable logs; use `status`, `tail`, or `read` with a session_id to inspect one.".to_string(),
+        );
+    } else {
+        lines.push(format!("{} live session(s):", snapshots.len()));
+        for snapshot in snapshots {
+            lines.push(render_snapshot_line(&snapshot, invocation));
+        }
     }
-    let mut lines = vec![format!("{} live session(s):", snapshots.len())];
-    for snapshot in snapshots {
-        lines.push(render_snapshot_line(&snapshot, invocation));
+    if !completed.is_empty() {
+        lines.push("Recently completed:".to_string());
+        for snapshot in completed {
+            lines.push(render_snapshot_line(&snapshot, invocation));
+        }
     }
     lines.join("\n")
 }
@@ -339,8 +360,8 @@ fn truncate_command(command: &str) -> String {
 /// most [`TAIL_SCAN_BYTES`] from the end. `None` when the file is unreadable.
 fn read_log_tail(path: &Path, lines: usize) -> Option<(String, u64)> {
     let (chunk, total_bytes) = read_file_end(path, TAIL_SCAN_BYTES)?;
-    let tail_lines: Vec<&str> = chunk.lines().rev().take(lines).collect();
-    let tail: Vec<&str> = tail_lines.into_iter().rev().collect();
+    let mut tail: Vec<&str> = chunk.lines().rev().take(lines).collect();
+    tail.reverse();
     Some((tail.join("\n"), total_bytes))
 }
 

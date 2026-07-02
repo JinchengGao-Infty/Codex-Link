@@ -36,7 +36,44 @@ pub(crate) enum JobWaitOutcome {
     Unknown,
 }
 
+const MAX_COMPLETED_JOBS: usize = 64;
+
 impl UnifiedExecProcessManager {
+    /// Records a session that is leaving the live store so `job_observe` can
+    /// still answer status and wait queries — exit code included — after the
+    /// process is reaped.
+    pub(super) fn archive_completed_entry(&self, entry: &super::ProcessEntry) {
+        let mut snapshot = snapshot_entry(entry);
+        snapshot.running = false;
+        self.archive_completed(snapshot);
+    }
+
+    pub(super) fn archive_completed(&self, snapshot: JobSnapshot) {
+        let Ok(mut completed) = self.completed_jobs.lock() else {
+            return;
+        };
+        completed.retain(|job| job.process_id != snapshot.process_id);
+        completed.push_back(snapshot);
+        while completed.len() > MAX_COMPLETED_JOBS {
+            completed.pop_front();
+        }
+    }
+
+    pub(crate) fn completed_job(&self, process_id: i32) -> Option<JobSnapshot> {
+        let completed = self.completed_jobs.lock().ok()?;
+        completed
+            .iter()
+            .find(|job| job.process_id == process_id)
+            .cloned()
+    }
+
+    /// Most recently completed first.
+    pub(crate) fn recent_completed_jobs(&self, limit: usize) -> Vec<JobSnapshot> {
+        match self.completed_jobs.lock() {
+            Ok(completed) => completed.iter().rev().take(limit).cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
     pub(crate) async fn job_snapshots(&self) -> Vec<JobSnapshot> {
         let store = self.process_store.lock().await;
         let mut snapshots: Vec<JobSnapshot> =
@@ -63,7 +100,16 @@ impl UnifiedExecProcessManager {
             let store = self.process_store.lock().await;
             match store.processes.get(&process_id) {
                 Some(entry) => Arc::clone(&entry.process),
-                None => return JobWaitOutcome::Unknown,
+                None => {
+                    // Already reaped sessions still resolve through the
+                    // completed archive instead of reporting Unknown.
+                    return match self.completed_job(process_id) {
+                        Some(job) => JobWaitOutcome::Exited {
+                            exit_code: job.exit_code,
+                        },
+                        None => JobWaitOutcome::Unknown,
+                    };
+                }
             }
         };
 
@@ -86,6 +132,10 @@ impl UnifiedExecProcessManager {
         JobWaitOutcome::Exited { exit_code }
     }
 }
+
+#[cfg(test)]
+#[path = "observation_tests.rs"]
+mod tests;
 
 fn snapshot_entry(entry: &super::ProcessEntry) -> JobSnapshot {
     JobSnapshot {

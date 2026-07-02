@@ -409,6 +409,7 @@ impl UnifiedExecProcessManager {
         };
         if let Some(entry) = removed {
             unregister_network_approval_for_entry(&entry).await;
+            self.archive_completed_entry(&entry);
         }
     }
 
@@ -895,6 +896,7 @@ impl UnifiedExecProcessManager {
             let Some(entry) = store.remove(process_id) else {
                 return ProcessStatus::Unknown;
             };
+            self.archive_completed_entry(&entry);
             ProcessStatus::Exited {
                 exit_code,
                 entry: Box::new(entry),
@@ -992,6 +994,7 @@ impl UnifiedExecProcessManager {
         if let Some(pruned_entry) = pruned_entry {
             unregister_network_approval_for_entry(&pruned_entry).await;
             pruned_entry.process.terminate();
+            self.archive_completed_entry(&pruned_entry);
         }
 
         spawn_exit_watcher(
@@ -1504,6 +1507,7 @@ impl UnifiedExecProcessManager {
         for entry in entries {
             unregister_network_approval_for_entry(&entry).await;
             entry.process.terminate();
+            self.archive_completed_entry(&entry);
         }
     }
 
@@ -1559,6 +1563,7 @@ impl UnifiedExecProcessManager {
         };
 
         unregister_network_approval_for_entry(&entry).await;
+        self.archive_completed_entry(&entry);
         true
     }
 }
