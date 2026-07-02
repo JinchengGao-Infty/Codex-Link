@@ -20,6 +20,7 @@ use serde_json::json;
 
 use crate::LinkContextStore;
 use crate::MAX_RECORDED_TOOL_EVENTS;
+use crate::evidence::EvidenceConfidence;
 use crate::evidence::EvidenceKind;
 use crate::evidence::EvidenceRecord;
 use crate::evidence::push_evidence;
@@ -43,6 +44,25 @@ struct RecordLinkContextArgs {
     kind: RecordKind,
     summary: String,
     related_paths: Option<Vec<String>>,
+    confidence: Option<RecordConfidence>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecordConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl From<RecordConfidence> for EvidenceConfidence {
+    fn from(confidence: RecordConfidence) -> Self {
+        match confidence {
+            RecordConfidence::High => EvidenceConfidence::High,
+            RecordConfidence::Medium => EvidenceConfidence::Medium,
+            RecordConfidence::Low => EvidenceConfidence::Low,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -88,12 +108,16 @@ impl ToolExecutor<ToolCall> for RecordLinkContextTool {
                 ));
             }
 
+            let confidence = args
+                .confidence
+                .map_or(EvidenceConfidence::Medium, EvidenceConfidence::from);
             let record = EvidenceRecord::model(args.kind.into(), summary.clone())
                 .with_source_ref(format!(
                     "turn {}, call {}",
                     invocation.turn_id, invocation.call_id
                 ))
-                .with_related_paths(args.related_paths.unwrap_or_default());
+                .with_related_paths(args.related_paths.unwrap_or_default())
+                .with_confidence(confidence);
             self.store.update(|state| {
                 match args.kind {
                     RecordKind::PlanUpdate => {
@@ -150,6 +174,16 @@ fn create_record_link_context_tool() -> ToolSpec {
             JsonSchema::array(
                 JsonSchema::string(None),
                 Some("File paths this fact is about.".to_string()),
+            ),
+        ),
+        (
+            "confidence".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("high"), json!("medium"), json!("low")],
+                Some(
+                    "How verified this fact is. `high`: you directly observed it this session (ran the command, read the file). `medium` (default): reasoned from evidence but not directly re-checked. `low`: plausible but unverified; must be re-checked before acting on it."
+                        .to_string(),
+                ),
             ),
         ),
     ]);

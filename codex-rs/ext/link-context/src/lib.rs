@@ -69,6 +69,7 @@ const MAX_RECORDED_BACKGROUND_EVENT_KEYS: usize = 128;
 const MAX_BACKGROUND_EVENT_TAIL_CHARS: usize = 2_000;
 
 pub mod evidence;
+mod gc;
 mod persistence;
 mod tool;
 
@@ -1045,6 +1046,13 @@ impl ThreadLifecycleContributor<codex_core::config::Config> for LinkContextExten
                     input.thread_store.level_id(),
                 );
                 store.attach_persistence(path);
+                // After hydration, sweep sidecar files left by long-dead
+                // threads. Off-thread so a large backlog cannot delay start.
+                let codex_home = input.config.codex_home.to_path_buf();
+                let thread_id = input.thread_store.level_id().to_string();
+                std::thread::spawn(move || {
+                    gc::collect_stale_sidecar_files(&codex_home, &thread_id);
+                });
             }
         })
     }
@@ -2331,10 +2339,31 @@ mod tests {
         assert_eq!(state.open_blockers, vec!["goals db is locked".to_string()]);
 
         let capsule = state.render_capsule().expect("capsule should render");
-        assert!(
-            capsule
-                .contains("[decision, model] Chose JSON sidecar over SQLite for Link persistence")
-        );
+        assert!(capsule.contains(
+            "[decision, model, conf=medium] Chose JSON sidecar over SQLite for Link persistence"
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_link_context_tool_accepts_explicit_confidence() {
+        let store = Arc::new(LinkContextStore::default());
+        let tool = RecordLinkContextTool::new(Arc::clone(&store));
+        let mut call = record_tool_call("observation", "flag may be unused");
+        call.payload = codex_extension_api::ToolPayload::Function {
+            arguments: serde_json::json!({
+                "kind": "observation",
+                "summary": "flag may be unused",
+                "confidence": "low",
+            })
+            .to_string(),
+        };
+        tool.handle(call).await.expect("tool call should succeed");
+
+        let capsule = store
+            .snapshot()
+            .render_capsule()
+            .expect("capsule should render");
+        assert!(capsule.contains("[observation, model, conf=low] flag may be unused"));
     }
 
     #[tokio::test]
@@ -2367,7 +2396,9 @@ mod tests {
         assert_eq!(state.verified_evidence.len(), 1);
         assert!(state.verified_evidence[0].stale);
         let capsule = state.render_capsule().expect("capsule should render");
-        assert!(capsule.contains("[decision, model, stale] use bf16 for the ablation"));
+        assert!(
+            capsule.contains("[decision, model, conf=medium, stale] use bf16 for the ablation")
+        );
     }
 
     #[test]

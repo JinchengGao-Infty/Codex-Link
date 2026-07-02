@@ -55,6 +55,28 @@ impl EvidenceSource {
     }
 }
 
+/// How much the record should be trusted before re-verification. Host-observed
+/// records default to `High`; model-reported records default to `Medium`
+/// because the model may misremember or overstate what it verified.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceConfidence {
+    High,
+    #[default]
+    Medium,
+    Low,
+}
+
+impl EvidenceConfidence {
+    fn label(self) -> &'static str {
+        match self {
+            EvidenceConfidence::High => "high",
+            EvidenceConfidence::Medium => "medium",
+            EvidenceConfidence::Low => "low",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EvidenceRecord {
@@ -64,6 +86,7 @@ pub struct EvidenceRecord {
     /// Turn, call, or process identifier that produced this record.
     pub source_ref: Option<String>,
     pub related_paths: Vec<String>,
+    pub confidence: EvidenceConfidence,
     /// Host clock at recording time (Unix millis); informational only.
     pub created_at_ms: Option<i64>,
     /// Set when the record predates the current process. Stale facts must be
@@ -79,6 +102,7 @@ impl EvidenceRecord {
             summary: summary.into(),
             source_ref: None,
             related_paths: Vec::new(),
+            confidence: EvidenceConfidence::High,
             created_at_ms: now_ms(),
             stale: false,
         }
@@ -87,8 +111,14 @@ impl EvidenceRecord {
     pub fn model(kind: EvidenceKind, summary: impl Into<String>) -> Self {
         Self {
             source: EvidenceSource::ModelReported,
+            confidence: EvidenceConfidence::Medium,
             ..Self::host(kind, summary)
         }
+    }
+
+    pub fn with_confidence(mut self, confidence: EvidenceConfidence) -> Self {
+        self.confidence = confidence;
+        self
     }
 
     pub fn with_source_ref(mut self, source_ref: impl Into<String>) -> Self {
@@ -111,6 +141,9 @@ impl EvidenceRecord {
     /// applies char and token limits).
     pub(crate) fn render(&self) -> String {
         let mut tags = format!("{}, {}", self.kind.label(), self.source.label());
+        if self.confidence != EvidenceConfidence::High {
+            tags.push_str(&format!(", conf={}", self.confidence.label()));
+        }
         if self.stale {
             tags.push_str(", stale");
         }
