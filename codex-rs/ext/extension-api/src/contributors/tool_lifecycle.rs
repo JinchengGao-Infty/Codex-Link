@@ -79,4 +79,9 @@ pub struct ToolFinishInput<'a> {
     pub source: ToolCallSource,
     /// Host-observed result of the tool call.
     pub outcome: ToolCallOutcome,
+    /// Bounded preview of the tool's output when a handler produced one.
+    ///
+    /// This is the same preview used for host logging, not the full
+    /// model-facing function-call output.
+    pub output_preview: Option<&'a str>,
 }

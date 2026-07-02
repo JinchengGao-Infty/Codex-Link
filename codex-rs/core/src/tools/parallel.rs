@@ -27,6 +27,11 @@ use crate::tools::router::ToolRouter;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
 
+pub(crate) struct HandledToolCall {
+    pub(crate) response: ResponseInputItem,
+    pub(crate) needs_follow_up: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
     router: Arc<ToolRouter>,
@@ -65,15 +70,24 @@ impl ToolCallRuntime {
         self,
         call: ToolCall,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
+    ) -> impl std::future::Future<Output = Result<HandledToolCall, CodexErr>> {
         let error_call = call.clone();
         let future =
             self.handle_tool_call_with_source(call, ToolCallSource::Direct, cancellation_token);
         async move {
             match future.await {
-                Ok(response) => Ok(response.into_response()),
+                Ok(response) => {
+                    let needs_follow_up = !response.result.ends_turn_after_record();
+                    Ok(HandledToolCall {
+                        response: response.into_response(),
+                        needs_follow_up,
+                    })
+                }
                 Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
-                Err(other) => Ok(Self::failure_response(error_call, other)),
+                Err(other) => Ok(HandledToolCall {
+                    response: Self::failure_response(error_call, other),
+                    needs_follow_up: true,
+                }),
             }
         }
         .in_current_span()
@@ -463,7 +477,8 @@ mod tests {
                 success: Some(true),
             },
         };
-        assert_eq!(expected_response, response);
+        assert_eq!(expected_response, response.response);
+        assert!(response.needs_follow_up);
 
         let actual = records
             .lock()
@@ -529,9 +544,10 @@ mod tests {
             .await
             .expect("timed out waiting for tool response")
             .expect("tool response task should join")?;
-        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response.response else {
             anyhow::bail!("cancelled tool should return function output");
         };
+        assert!(response.needs_follow_up);
         let FunctionCallOutputBody::Text(text) = output.body else {
             anyhow::bail!("cancelled tool output should be text");
         };

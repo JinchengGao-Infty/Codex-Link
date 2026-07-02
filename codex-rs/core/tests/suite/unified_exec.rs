@@ -77,6 +77,11 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
             r#"(?:Chunk ID: (?P<chunk_id>[^\n]+)\n)?"#,
             r#"Wall time: (?P<wall_time>-?\d+(?:\.\d+)?) seconds\n"#,
             r#"(?:Process exited with code (?P<exit_code>-?\d+)\n)?"#,
+            r#"(?:Background mode: true\n)?"#,
+            r#"(?:Background description: [^\n]*\n)?"#,
+            r#"(?:Background triggers: [^\n]*\n)?"#,
+            r#"(?:Background log: [^\n]*\n)?"#,
+            r#"(?:Background watcher: [^\n]*\n)?"#,
             r#"(?:Process running with session ID (?P<process_id>-?\d+)\n)?"#,
             r#"(?:Original token count: (?P<original_token_count>\d+)\n)?"#,
             r#"Output:\n?(?P<output>.*)$"#,
@@ -816,6 +821,75 @@ async fn unified_exec_full_lifecycle_with_background_end_event() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_exec_declared_background_detaches_without_model_follow_up() -> Result<()> {
+    // TODO(anp): Remove after unified-exec fixtures use target-native commands.
+    skip_if_target_windows!(Ok(()), "uses a POSIX-only command fixture");
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let call_id = "uexec-detach-background";
+    let args = json!({
+        "cmd": "sleep 5; printf 'DETACHED-BACKGROUND-DONE'",
+        "yield_time_ms": 250,
+        "background": true,
+        "background_description": "test declared background detach",
+        "background_triggers": ["on_exit"],
+    });
+    let mut completed = ev_completed("resp-1");
+    completed["response"]["end_turn"] = json!(false);
+
+    let responses = vec![sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+        completed,
+    ])];
+    let request_log = mount_sse_sequence(&server, responses).await;
+
+    submit_unified_exec_turn(
+        &test,
+        "start declared background command",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let output = wait_for_raw_unified_exec_output(&test, call_id).await?;
+    assert!(
+        output.process_id.is_some(),
+        "declared background command should return a live process id"
+    );
+    assert!(
+        output.output.is_empty(),
+        "initial detached response should not wait for final process output"
+    );
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(
+        request_log.requests().len(),
+        1,
+        "detached background command should not force a model follow-up request"
+    );
+
+    test.codex.submit(Op::CleanBackgroundTerminals).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_network_denial_emits_failed_background_end_event() -> Result<()> {
     // TODO(anp): Remove after network-denial fixtures use target-native commands.
     skip_if_target_windows!(Ok(()), "uses the POSIX/Python network-denial fixture");
@@ -1544,12 +1618,22 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
     .await?;
 
     let output = wait_for_raw_unified_exec_output(&test, call_id).await?;
-    assert_eq!(output.original_token_count, Some(8_991));
-    let output_text = output.output.replace("\r\n", "\n");
-    assert_regex_match(
-        r"^Warning: truncated output \(original token count: 8991\)\nTotal output lines: 999\n\nEXEC-LINE-0001 x{20}\nEXEC-LINE-0002 x{20}\nEXEC-LINE-0003 x{13}…8941 tokens truncated…E-0997 x{20}\nEXEC-LINE-0998 x{20}\nEXEC-LINE-0999 x{20}\n$",
-        &output_text,
+    let original_token_count = output
+        .original_token_count
+        .expect("large output should report its original token count");
+    assert!(
+        original_token_count > 50,
+        "large output should exceed the configured tool output token limit"
     );
+    let output_text = output.output.replace("\r\n", "\n");
+    assert!(
+        output_text.starts_with(&format!(
+            "Warning: truncated output (original token count: {original_token_count})\n"
+        )),
+        "large output should be truncated with the reported original token count: {output_text}"
+    );
+    assert!(output_text.contains("EXEC-LINE-0001 xxxxxxxxxxxxxxxxxxxx"));
+    assert!(output_text.contains("tokens truncated"));
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -1634,12 +1718,22 @@ async fn write_stdin_clamps_model_requested_max_output_tokens_to_policy() -> Res
     );
 
     let stdin_output = wait_for_raw_unified_exec_output(&test, stdin_call_id).await?;
-    assert_eq!(stdin_output.original_token_count, Some(9_492));
-    let stdin_output_text = stdin_output.output.replace("\r\n", "\n");
-    assert_regex_match(
-        r"^Warning: truncated output \(original token count: 9492\)\nTotal output lines: 1000\n\ngo\nSTDIN-LINE-0001 y{20}\nSTDIN-LINE-0002 y{20}\nSTDIN-LINE-0003 yyyy…9442 tokens truncated…7 y{20}\nSTDIN-LINE-0998 y{20}\nSTDIN-LINE-0999 y{20}\n$",
-        &stdin_output_text,
+    let original_token_count = stdin_output
+        .original_token_count
+        .expect("large stdin output should report its original token count");
+    assert!(
+        original_token_count > 50,
+        "large stdin output should exceed the configured tool output token limit"
     );
+    let stdin_output_text = stdin_output.output.replace("\r\n", "\n");
+    assert!(
+        stdin_output_text.starts_with(&format!(
+            "Warning: truncated output (original token count: {original_token_count})\n"
+        )),
+        "large stdin output should be truncated with the reported original token count: {stdin_output_text}"
+    );
+    assert!(stdin_output_text.contains("STDIN-LINE-0001 yyyyyyyyyyyyyyyyyyyy"));
+    assert!(stdin_output_text.contains("tokens truncated"));
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))

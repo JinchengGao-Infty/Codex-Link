@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -44,6 +45,8 @@ use crate::shell::ShellType;
 use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
+mod background_output_log;
+mod background_triggers;
 mod errors;
 mod head_tail_buffer;
 mod process;
@@ -54,6 +57,8 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
 }
 
+pub(crate) use background_output_log::BackgroundOutputLog;
+pub(crate) use background_triggers::BackgroundTriggerPolicy;
 pub(crate) use errors::UnifiedExecError;
 pub(crate) use process::NoopSpawnLifecycle;
 #[cfg(unix)]
@@ -65,7 +70,10 @@ pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
 pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
 // Minimum yield time for an empty `write_stdin`.
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
-pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
+pub(crate) const DEFAULT_BACKGROUND_EXEC_YIELD_TIME_MS: u64 = MIN_YIELD_TIME_MS;
+pub(crate) const DEFAULT_FOREGROUND_EXEC_YIELD_TIME_MS: u64 = 600_000;
+pub(crate) const MAX_YIELD_TIME_MS: u64 = DEFAULT_FOREGROUND_EXEC_YIELD_TIME_MS;
+pub(crate) const MAX_NON_EMPTY_STDIN_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
@@ -107,6 +115,12 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
+    pub background_description: Option<String>,
+    pub background_triggers: Vec<String>,
+    pub background_trigger_policy: Option<BackgroundTriggerPolicy>,
+    pub background_log_path: Option<PathBuf>,
+    pub background_declared: bool,
+    pub end_turn_after_record: bool,
 }
 
 #[derive(Debug)]
@@ -161,6 +175,8 @@ struct ProcessEntry {
     hook_command: String,
     tty: bool,
     network_approval: Option<DeferredNetworkApproval>,
+    background_description: Option<String>,
+    background_triggers: Vec<String>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }

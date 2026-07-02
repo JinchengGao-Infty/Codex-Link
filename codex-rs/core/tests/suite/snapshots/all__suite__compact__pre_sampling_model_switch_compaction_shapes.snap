@@ -18,7 +18,7 @@ Scenario: Pre-sampling compaction on model switch to a smaller context window: c
 
 ## Post-Compaction Follow-up Request (Next Model)
 00:message/user:before switch
-01:message/user:<COMPACTION_SUMMARY>\nPRE_SAMPLING_SUMMARY
+01:message/user:<codex_compacted_conversation_summary>\nThis block is an automat...
 02:message/developer[2]:
     [01] <model_switch>\nThe user was previously using a different model....
     [02] <PERMISSIONS_INSTRUCTIONS>

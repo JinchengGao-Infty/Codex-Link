@@ -2,10 +2,13 @@ use super::*;
 use crate::shell::ShellType;
 use crate::shell::default_user_shell;
 use codex_exec_server::Environment;
+use codex_protocol::models::ResponseInputItem;
+use codex_tools::ToolExecutor;
 use codex_tools::UnifiedExecShellMode;
 use codex_tools::ZshForkConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
+use core_test_support::skip_if_sandbox;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
@@ -239,12 +242,13 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
         arguments: serde_json::json!({ "cmd": "printf exec command" }).to_string(),
     };
     let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
     let turn = Arc::new(turn);
     let handler = ExecCommandHandler::default();
 
     assert_eq!(
         handler.pre_tool_use_payload(&ToolInvocation {
-            session: session.into(),
+            session,
             step_context: StepContext::for_test(Arc::clone(&turn)),
             turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
@@ -302,6 +306,8 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
+        background: None,
+        end_turn_after_record: false,
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
     let handler = ExecCommandHandler::default();
@@ -332,6 +338,8 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
+        background: None,
+        end_turn_after_record: false,
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
     let handler = ExecCommandHandler::default();
@@ -363,10 +371,122 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         exit_code: None,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
+        background: None,
+        end_turn_after_record: false,
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
     let handler = ExecCommandHandler::default();
     assert_eq!(handler.post_tool_use_payload(&invocation, &output), None);
+}
+
+#[tokio::test]
+async fn exec_command_short_yield_running_foreground_command_stays_interactive()
+-> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "cmd": "sleep 5",
+            "yield_time_ms": 250,
+        })
+        .to_string(),
+    };
+    let invocation = ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "call-auto-bg".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload: payload.clone(),
+    };
+
+    let output = ExecCommandHandler::default().handle(invocation).await?;
+    let response = output.to_response_item("call-auto-bg", &payload);
+
+    let ResponseInputItem::FunctionCallOutput {
+        output: payload_output,
+        ..
+    } = response
+    else {
+        panic!("expected function-call output");
+    };
+    let text = payload_output
+        .body
+        .to_text()
+        .expect("exec output should serialize as text");
+
+    assert!(!text.contains("Background mode: true"));
+    assert!(!text.contains("Background triggers:"));
+    assert!(!text.contains("Background log:"));
+    assert!(!text.contains("Background watcher:"));
+    assert!(text.contains("Process running with session ID"));
+    assert!(!output.ends_turn_after_record());
+
+    for process in session.list_background_terminals().await {
+        if let Ok(process_id) = process.process_id.parse::<i32>() {
+            session.terminate_background_terminal(process_id).await;
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn exec_command_completed_foreground_command_hides_auto_background_metadata()
+-> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "cmd": "printf done",
+            "yield_time_ms": 1_000,
+        })
+        .to_string(),
+    };
+    let invocation = ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "call-foreground".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload: payload.clone(),
+    };
+
+    let output = ExecCommandHandler::default().handle(invocation).await?;
+    let response = output.to_response_item("call-foreground", &payload);
+
+    let ResponseInputItem::FunctionCallOutput {
+        output: payload_output,
+        ..
+    } = response
+    else {
+        panic!("expected function-call output");
+    };
+    let text = payload_output
+        .body
+        .to_text()
+        .expect("exec output should serialize as text");
+
+    assert!(!text.contains("Background mode: true"));
+    assert!(!text.contains("Background triggers:"));
+    assert!(!text.contains("Background log:"));
+    assert!(!text.contains("Process running with session ID"));
+    assert!(text.contains("Output:\ndone"));
+    assert!(!output.ends_turn_after_record());
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -389,6 +509,8 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
+        background: None,
+        end_turn_after_record: false,
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
     let handler = WriteStdinHandler;
@@ -420,6 +542,8 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
+        background: None,
+        end_turn_after_record: false,
     };
     let output_b = ExecCommandToolOutput {
         event_call_id: "exec-call-b".to_string(),
@@ -432,6 +556,8 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
+        background: None,
+        end_turn_after_record: false,
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
     let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;

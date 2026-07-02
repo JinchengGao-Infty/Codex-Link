@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::tools::context::ExecBackgroundMetadata;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -21,6 +22,9 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use crate::unified_exec::BackgroundTriggerPolicy;
+use crate::unified_exec::DEFAULT_BACKGROUND_EXEC_YIELD_TIME_MS;
+use crate::unified_exec::DEFAULT_FOREGROUND_EXEC_YIELD_TIME_MS;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
@@ -45,6 +49,10 @@ use super::ExecCommandEnvironmentArgs;
 use super::get_command;
 use super::post_unified_exec_tool_use_payload;
 use super::shell_mode_for_environment;
+
+const MAX_BACKGROUND_DESCRIPTION_CHARS: usize = 500;
+const MAX_BACKGROUND_TRIGGER_COUNT: usize = 8;
+const MAX_BACKGROUND_TRIGGER_CHARS: usize = 160;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExecCommandHandlerOptions {
@@ -189,6 +197,20 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
+        let background = validate_background_args(&args)?;
+        let background_declared = background.is_some();
+        let yield_time_ms = exec_yield_time_ms(&args, background.is_some());
+        let end_turn_after_record =
+            background_declared || yield_time_ms >= DEFAULT_FOREGROUND_EXEC_YIELD_TIME_MS;
+        let background_metadata = background
+            .clone()
+            .unwrap_or_else(automatic_background_metadata);
+        let background_trigger_policy = BackgroundTriggerPolicy::parse_declared(
+            &background_metadata.triggers,
+        )
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!("invalid background_triggers: {err}"))
+        })?;
         let hook_command = args.cmd.clone();
         // TODO(anp) wire PathUri through implicit skills instead of skipping on foreign paths
         if let Some(native_cwd) = native_cwd.as_ref() {
@@ -229,6 +251,15 @@ impl ExecCommandHandler {
             }
         }
         let process_id = manager.allocate_process_id().await;
+        let background_log_path = context
+            .turn
+            .config
+            .codex_home
+            .join("link")
+            .join("jobs")
+            .join(context.session.thread_id.to_string())
+            .join(format!("exec-{process_id}.log"))
+            .to_path_buf();
         let resolved_command = get_command(
             &args,
             shell,
@@ -242,7 +273,6 @@ impl ExecCommandHandler {
 
         let ExecCommandArgs {
             tty,
-            yield_time_ms,
             max_output_tokens,
             sandbox_permissions,
             additional_permissions,
@@ -336,6 +366,8 @@ impl ExecCommandHandler {
                 exit_code: None,
                 original_token_count: None,
                 hook_command: None,
+                background: None,
+                end_turn_after_record: false,
             }));
         }
 
@@ -361,6 +393,12 @@ impl ExecCommandHandler {
                         .permissions_preapproved,
                     justification,
                     prefix_rule,
+                    background_description: Some(background_metadata.description.clone()),
+                    background_triggers: background_metadata.triggers.clone(),
+                    background_trigger_policy,
+                    background_log_path: Some(background_log_path),
+                    background_declared,
+                    end_turn_after_record,
                 },
                 &context,
             )
@@ -383,6 +421,8 @@ impl ExecCommandHandler {
                     exit_code: Some(output.exit_code),
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
+                    background: None,
+                    end_turn_after_record: false,
                 }))
             }
             Err(err) => Err(FunctionCallError::RespondToModel(format!(
@@ -390,6 +430,75 @@ impl ExecCommandHandler {
             ))),
         }
     }
+}
+
+fn exec_yield_time_ms(args: &ExecCommandArgs, declared_background: bool) -> u64 {
+    args.yield_time_ms.unwrap_or(if declared_background {
+        DEFAULT_BACKGROUND_EXEC_YIELD_TIME_MS
+    } else {
+        DEFAULT_FOREGROUND_EXEC_YIELD_TIME_MS
+    })
+}
+
+fn automatic_background_metadata() -> ExecBackgroundMetadata {
+    ExecBackgroundMetadata {
+        description:
+            "Auto-backgrounded if still running after the foreground wait; completion will notify the session."
+                .to_string(),
+        triggers: vec!["on_exit".to_string()],
+        log_path: None,
+    }
+}
+
+fn validate_background_args(
+    args: &ExecCommandArgs,
+) -> Result<Option<ExecBackgroundMetadata>, FunctionCallError> {
+    if !args.background {
+        return Ok(None);
+    }
+
+    let Some(description) = args
+        .background_description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(FunctionCallError::RespondToModel(
+            "`background_description` is required when `background` is true; describe the job purpose and success/attention condition.".to_string(),
+        ));
+    };
+
+    if description.chars().count() > MAX_BACKGROUND_DESCRIPTION_CHARS {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "`background_description` must be at most {MAX_BACKGROUND_DESCRIPTION_CHARS} characters"
+        )));
+    }
+
+    if args.background_triggers.len() > MAX_BACKGROUND_TRIGGER_COUNT {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "`background_triggers` must contain at most {MAX_BACKGROUND_TRIGGER_COUNT} entries"
+        )));
+    }
+
+    let mut triggers = Vec::with_capacity(args.background_triggers.len());
+    for trigger in &args.background_triggers {
+        let trigger = trigger.trim();
+        if trigger.is_empty() {
+            continue;
+        }
+        if trigger.chars().count() > MAX_BACKGROUND_TRIGGER_CHARS {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "`background_triggers` entries must be at most {MAX_BACKGROUND_TRIGGER_CHARS} characters"
+            )));
+        }
+        triggers.push(trigger.to_string());
+    }
+
+    Ok(Some(ExecBackgroundMetadata {
+        description: description.to_string(),
+        triggers,
+        log_path: None,
+    }))
 }
 
 impl CoreToolRuntime for ExecCommandHandler {
@@ -446,4 +555,106 @@ fn emit_unified_exec_tty_metric(session_telemetry: &SessionTelemetry, tty: bool)
         /*inc*/ 1,
         &[("tty", if tty { "true" } else { "false" })],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args() -> ExecCommandArgs {
+        ExecCommandArgs {
+            cmd: "sleep 60".to_string(),
+            shell: None,
+            login: None,
+            tty: false,
+            yield_time_ms: Some(1_000),
+            max_output_tokens: None,
+            sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+            additional_permissions: None,
+            justification: None,
+            prefix_rule: None,
+            background: false,
+            background_description: None,
+            background_triggers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exec_yield_time_defaults_to_foreground_auto_background_threshold() {
+        let mut args = base_args();
+        args.yield_time_ms = None;
+
+        assert_eq!(
+            exec_yield_time_ms(&args, /*declared_background*/ false),
+            DEFAULT_FOREGROUND_EXEC_YIELD_TIME_MS
+        );
+    }
+
+    #[test]
+    fn exec_yield_time_keeps_short_default_for_declared_background_jobs() {
+        let mut args = base_args();
+        args.yield_time_ms = None;
+
+        assert_eq!(
+            exec_yield_time_ms(&args, /*declared_background*/ true),
+            DEFAULT_BACKGROUND_EXEC_YIELD_TIME_MS
+        );
+    }
+
+    #[test]
+    fn automatic_background_metadata_defaults_to_exit_notification() {
+        let metadata = automatic_background_metadata();
+
+        assert_eq!(
+            metadata,
+            ExecBackgroundMetadata {
+                description:
+                    "Auto-backgrounded if still running after the foreground wait; completion will notify the session."
+                        .to_string(),
+                triggers: vec!["on_exit".to_string()],
+                log_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn background_args_require_description() {
+        let mut args = base_args();
+        args.background = true;
+
+        let err = validate_background_args(&args).expect_err("description should be required");
+
+        assert!(format!("{err}").contains("background_description"));
+    }
+
+    #[test]
+    fn background_args_preserve_description_and_triggers() {
+        let mut args = base_args();
+        args.background = true;
+        args.background_description = Some("train until val_loss < 0.30".to_string());
+        args.background_triggers = vec![" on_exit ".to_string(), "".to_string()];
+
+        let metadata = validate_background_args(&args)
+            .expect("valid background metadata")
+            .expect("metadata should be present");
+
+        assert_eq!(metadata.description, "train until val_loss < 0.30");
+        assert_eq!(metadata.triggers, vec!["on_exit".to_string()]);
+    }
+
+    #[test]
+    fn background_trigger_policy_rejects_invalid_structured_trigger() {
+        let mut args = base_args();
+        args.background = true;
+        args.background_description = Some("train until val_loss < 0.30".to_string());
+        args.background_triggers = vec!["metric_threshold:val_loss below 0.30".to_string()];
+
+        let metadata = validate_background_args(&args)
+            .expect("background metadata shape is valid")
+            .expect("metadata should be present");
+        let err = BackgroundTriggerPolicy::parse_declared(&metadata.triggers)
+            .expect_err("invalid structured trigger should fail");
+
+        assert!(err.contains("must use one of"));
+    }
 }

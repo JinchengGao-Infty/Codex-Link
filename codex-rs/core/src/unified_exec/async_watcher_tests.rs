@@ -1,3 +1,4 @@
+use super::BackgroundEventNotifier;
 use super::split_valid_utf8_prefix_with_max;
 
 use pretty_assertions::assert_eq;
@@ -36,4 +37,14 @@ fn split_valid_utf8_prefix_makes_progress_on_invalid_utf8() {
         split_valid_utf8_prefix_with_max(&mut buf, /*max_bytes*/ 2).expect("expected prefix");
     assert_eq!(first, vec![0xff]);
     assert_eq!(buf, b"ab".to_vec());
+}
+
+#[tokio::test]
+async fn background_event_notifier_dedupes_process_trigger_keys() {
+    let notifier = BackgroundEventNotifier::default();
+
+    assert!(notifier.mark_notified("1000", "on_exit").await);
+    assert!(!notifier.mark_notified("1000", "on_exit").await);
+    assert!(notifier.mark_notified("1000", "failure_exit").await);
+    assert!(notifier.mark_notified("1001", "on_exit").await);
 }

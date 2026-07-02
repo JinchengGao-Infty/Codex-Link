@@ -20,6 +20,7 @@ use codex_extension_api::ToolContributor;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::TurnContextContributionInput;
+use codex_extension_api::TurnEventContributor;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputContributor;
 use codex_extension_api::TurnItemContributor;
@@ -48,6 +49,8 @@ impl ContextContributor for AllContributors {
 impl ThreadLifecycleContributor<()> for AllContributors {}
 
 impl TurnLifecycleContributor for AllContributors {}
+
+impl TurnEventContributor for AllContributors {}
 
 impl ConfigContributor<()> for AllContributors {}
 
@@ -119,6 +122,7 @@ async fn build_round_trips_every_contributor_category() {
     builder.token_usage_contributor(contributor.clone());
     builder.prompt_contributor(contributor.clone());
     builder.turn_input_contributor(contributor.clone());
+    builder.turn_event_contributor(contributor.clone());
     builder.tool_contributor(contributor.clone());
     builder.tool_lifecycle_contributor(contributor.clone());
     builder.turn_item_contributor(contributor.clone());
@@ -131,6 +135,7 @@ async fn build_round_trips_every_contributor_category() {
     assert_eq!(registry.token_usage_contributors().len(), 1);
     assert_eq!(registry.context_contributors().len(), 1);
     assert_eq!(registry.turn_input_contributors().len(), 1);
+    assert_eq!(registry.turn_event_contributors().len(), 1);
     assert_eq!(registry.tool_contributors().len(), 1);
     assert_eq!(registry.tool_lifecycle_contributors().len(), 1);
     assert_eq!(registry.turn_item_contributors().len(), 1);

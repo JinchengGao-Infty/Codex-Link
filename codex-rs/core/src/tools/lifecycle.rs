@@ -30,7 +30,11 @@ pub(crate) async fn notify_tool_start(invocation: &ToolInvocation) {
     }
 }
 
-pub(crate) async fn notify_tool_finish(invocation: &ToolInvocation, outcome: ToolCallOutcome) {
+pub(crate) async fn notify_tool_finish(
+    invocation: &ToolInvocation,
+    outcome: ToolCallOutcome,
+    output_preview: Option<&str>,
+) {
     notify_tool_finish_parts(
         invocation.session.as_ref(),
         invocation.turn.as_ref(),
@@ -38,6 +42,7 @@ pub(crate) async fn notify_tool_finish(invocation: &ToolInvocation, outcome: Too
         &invocation.tool_name,
         invocation.source.clone(),
         outcome,
+        output_preview,
     )
     .await;
 }
@@ -56,6 +61,7 @@ pub(crate) async fn notify_tool_aborted(
         tool_name,
         source,
         ToolCallOutcome::Aborted,
+        None,
     )
     .await;
 }
@@ -67,6 +73,7 @@ async fn notify_tool_finish_parts(
     tool_name: &ToolName,
     source: ToolCallSource,
     outcome: ToolCallOutcome,
+    output_preview: Option<&str>,
 ) {
     for contributor in session.services.extensions.tool_lifecycle_contributors() {
         contributor
@@ -79,6 +86,7 @@ async fn notify_tool_finish_parts(
                 tool_name,
                 source: extension_tool_call_source(source.clone()),
                 outcome,
+                output_preview,
             })
             .await;
     }

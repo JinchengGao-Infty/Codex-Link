@@ -21,10 +21,12 @@ use crate::exec_policy::ExecApprovalRequest;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::ExecServerEnvConfig;
+use crate::tools::context::ExecBackgroundMetadata;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;
+use crate::tools::events::UnifiedExecBackgroundMetadata;
 use crate::tools::network_approval::DeferredNetworkApproval;
 use crate::tools::network_approval::finish_deferred_network_approval;
 use crate::tools::orchestrator::ToolOrchestrator;
@@ -34,9 +36,10 @@ use crate::tools::runtimes::unified_exec::UnifiedExecRuntime;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
+use crate::unified_exec::BackgroundOutputLog;
 use crate::unified_exec::ExecCommandRequest;
+use crate::unified_exec::MAX_NON_EMPTY_STDIN_YIELD_TIME_MS;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
-use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
 use crate::unified_exec::ProcessEntry;
@@ -45,10 +48,14 @@ use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::async_watcher::BackgroundEventNotifier;
+use crate::unified_exec::async_watcher::BackgroundTriggerWatchConfig;
+use crate::unified_exec::async_watcher::emit_background_trigger_events as emit_background_trigger_events_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
+use crate::unified_exec::background_triggers::BackgroundTriggerEvaluator;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
@@ -411,8 +418,23 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
+        let background_output_log = match request.background_log_path.clone() {
+            Some(path) => match BackgroundOutputLog::create(path).await {
+                Ok(log) => Some(log),
+                Err(err) => {
+                    tracing::warn!("failed to create unified exec background output log: {err}");
+                    None
+                }
+            },
+            None => None,
+        };
         let process = self
-            .open_session_with_sandbox(&request, cwd.clone(), context)
+            .open_session_with_sandbox(
+                &request,
+                cwd.clone(),
+                context,
+                background_output_log.clone(),
+            )
             .await;
 
         let (process, mut deferred_network_approval) = match process {
@@ -439,15 +461,45 @@ impl UnifiedExecProcessManager {
             &context.call_id,
             /*turn_diff_tracker*/ None,
         );
-        let emitter = ToolEmitter::unified_exec(
+        let emitter = ToolEmitter::unified_exec_with_background_metadata(
             &request.command,
             cwd.clone(),
             ExecCommandSource::UnifiedExecStartup,
             Some(request.process_id.to_string()),
+            UnifiedExecBackgroundMetadata {
+                description: request
+                    .background_declared
+                    .then(|| request.background_description.clone())
+                    .flatten(),
+                triggers: if request.background_declared {
+                    request.background_triggers.clone()
+                } else {
+                    Vec::new()
+                },
+            },
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
-        start_streaming_output(&process, context, Arc::clone(&transcript));
+        let background_event_notifier = BackgroundEventNotifier::default();
+        let background_trigger_watch =
+            request
+                .background_trigger_policy
+                .clone()
+                .map(|policy| BackgroundTriggerWatchConfig {
+                    process_id: request.process_id,
+                    command: request.command.clone(),
+                    cwd: cwd.clone(),
+                    description: request.background_description.clone(),
+                    declared_triggers: request.background_triggers.clone(),
+                    policy,
+                });
+        start_streaming_output(
+            &process,
+            context,
+            Arc::clone(&transcript),
+            background_trigger_watch,
+            background_event_notifier.clone(),
+        );
         let start = Instant::now();
         // Persist live sessions before the initial yield wait so interrupting the
         // turn cannot drop the last Arc and terminate the background process.
@@ -464,8 +516,12 @@ impl UnifiedExecProcessManager {
                 request.process_id,
                 request.tty,
                 deferred_network_approval.clone(),
+                request.background_description.clone(),
+                request.background_triggers.clone(),
+                background_event_notifier.clone(),
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
+                request.end_turn_after_record,
             )
             .await;
             Some(InitialExecCommandGuard {
@@ -504,6 +560,24 @@ impl UnifiedExecProcessManager {
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let text = String::from_utf8_lossy(&collected).to_string();
+        if let Some(policy) = request.background_trigger_policy.clone()
+            && !text.is_empty()
+        {
+            let mut evaluator = BackgroundTriggerEvaluator::new(policy, start);
+            let fired = evaluator.on_output(&text, Instant::now());
+            emit_background_trigger_events_for_unified_exec(
+                Arc::clone(&context.session),
+                Arc::clone(&context.turn),
+                background_event_notifier.clone(),
+                context.call_id.clone(),
+                request.process_id.to_string(),
+                request.command.clone(),
+                cwd.clone(),
+                request.background_description.clone(),
+                request.background_triggers.clone(),
+                fired,
+            );
+        }
         let chunk_id = generate_chunk_id();
         if deferred_network_approval
             .as_ref()
@@ -622,6 +696,8 @@ impl UnifiedExecProcessManager {
         };
 
         let original_token_count = approx_token_count(&text);
+        let response_is_supervised_background =
+            response_process_id.is_some() && request.end_turn_after_record;
         let response = ExecCommandToolOutput {
             event_call_id: context.call_id.clone(),
             chunk_id,
@@ -633,6 +709,17 @@ impl UnifiedExecProcessManager {
             exit_code,
             original_token_count: Some(original_token_count),
             hook_command: Some(request.hook_command.clone()),
+            background: response_is_supervised_background.then(|| ExecBackgroundMetadata {
+                description: request.background_description.clone().unwrap_or_else(|| {
+                    "Background command is running under native unified_exec supervision."
+                        .to_string()
+                }),
+                triggers: request.background_triggers.clone(),
+                log_path: background_output_log
+                    .as_ref()
+                    .map(|log| log.path().to_path_buf()),
+            }),
+            end_turn_after_record: response_is_supervised_background,
         };
 
         Ok(response)
@@ -699,7 +786,7 @@ impl UnifiedExecProcessManager {
             if request.input.is_empty() {
                 time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
             } else {
-                time_ms.min(MAX_YIELD_TIME_MS)
+                time_ms.min(MAX_NON_EMPTY_STDIN_YIELD_TIME_MS)
             }
         };
         let start = Instant::now();
@@ -788,6 +875,8 @@ impl UnifiedExecProcessManager {
             exit_code,
             original_token_count: Some(original_token_count),
             hook_command: Some(hook_command),
+            background: None,
+            end_turn_after_record: false,
         };
 
         Ok(response)
@@ -871,18 +960,24 @@ impl UnifiedExecProcessManager {
         process_id: i32,
         tty: bool,
         network_approval: Option<DeferredNetworkApproval>,
+        background_description: Option<String>,
+        background_triggers: Vec<String>,
+        background_event_notifier: BackgroundEventNotifier,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
+        notify_background_exit: bool,
     ) {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
             call_id: context.call_id.clone(),
             process_id,
             cwd: cwd.clone(),
-            initial_exec_command_active,
+            initial_exec_command_active: Arc::clone(&initial_exec_command_active),
             hook_command,
             tty,
             network_approval,
+            background_description: background_description.clone(),
+            background_triggers: background_triggers.clone(),
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
@@ -909,6 +1004,11 @@ impl UnifiedExecProcessManager {
             process_id,
             transcript,
             started_at,
+            initial_exec_command_active,
+            notify_background_exit,
+            background_description,
+            background_triggers,
+            background_event_notifier,
         );
     }
 
@@ -925,6 +1025,7 @@ impl UnifiedExecProcessManager {
         tty: bool,
         spawn_lifecycle: SpawnLifecycleHandle,
         environment: &codex_exec_server::Environment,
+        background_output_log: Option<BackgroundOutputLog>,
     ) -> Result<UnifiedExecProcess, ToolError> {
         let mut request = if environment.is_remote() {
             attempt.env_for_exec_server(command, options, network, environment_id)
@@ -939,6 +1040,7 @@ impl UnifiedExecProcessManager {
             tty,
             spawn_lifecycle,
             environment,
+            background_output_log,
         )
         .await
         .map_err(|err| match err {
@@ -959,6 +1061,7 @@ impl UnifiedExecProcessManager {
         tty: bool,
         mut spawn_lifecycle: SpawnLifecycleHandle,
         environment: &codex_exec_server::Environment,
+        background_output_log: Option<BackgroundOutputLog>,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
         let inherited_fds = spawn_lifecycle.inherited_fds();
 
@@ -1045,6 +1148,7 @@ impl UnifiedExecProcessManager {
                 spawned.map_err(|err| UnifiedExecError::create_process(err.to_string()))?,
                 request.sandbox,
                 spawn_lifecycle,
+                background_output_log.clone(),
             )
             .await;
         }
@@ -1061,7 +1165,8 @@ impl UnifiedExecProcessManager {
                 .await
                 .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
-            return UnifiedExecProcess::from_exec_server_started(started).await;
+            return UnifiedExecProcess::from_exec_server_started(started, background_output_log)
+                .await;
         }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
@@ -1101,7 +1206,13 @@ impl UnifiedExecProcessManager {
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
         spawn_lifecycle.after_spawn();
-        UnifiedExecProcess::from_spawned(spawned, request.sandbox, spawn_lifecycle).await
+        UnifiedExecProcess::from_spawned(
+            spawned,
+            request.sandbox,
+            spawn_lifecycle,
+            background_output_log,
+        )
+        .await
     }
 
     pub(super) async fn open_session_with_sandbox(
@@ -1109,6 +1220,7 @@ impl UnifiedExecProcessManager {
         request: &ExecCommandRequest,
         cwd: PathUri,
         context: &UnifiedExecContext,
+        background_output_log: Option<BackgroundOutputLog>,
     ) -> Result<(UnifiedExecProcess, Option<DeferredNetworkApproval>), UnifiedExecError> {
         let local_policy_env = create_env(
             &context.turn.config.permissions.shell_environment_policy,
@@ -1172,6 +1284,7 @@ impl UnifiedExecProcessManager {
             additional_permissions_preapproved: request.additional_permissions_preapproved,
             justification: request.justification.clone(),
             exec_approval_requirement,
+            background_output_log,
         };
         let tool_ctx = ToolCtx {
             session: context.session.clone(),
@@ -1409,6 +1522,8 @@ impl UnifiedExecProcessManager {
                 process_id: entry.process_id.to_string(),
                 command: entry.hook_command.clone(),
                 cwd: entry.cwd.clone(),
+                background_description: entry.background_description.clone(),
+                background_triggers: entry.background_triggers.clone(),
             })
             .collect()
     }

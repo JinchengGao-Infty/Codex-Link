@@ -64,6 +64,8 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
         parsed_cmd: Vec::new(),
         source: ExecCommandSource::Agent,
         interaction_input: None,
+        background_description: None,
+        background_triggers: Vec::new(),
     });
     let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
         call_id: "call-end".to_string(),

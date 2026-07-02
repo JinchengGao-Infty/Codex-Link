@@ -266,6 +266,11 @@ pub enum ThreadItem {
         cwd: LegacyAppPathString,
         /// Identifier for the underlying PTY process (when available).
         process_id: Option<String>,
+        /// Short purpose for long-running background command executions.
+        background_description: Option<String>,
+        /// Raw trigger policy strings declared for long-running background command executions.
+        #[serde(default)]
+        background_triggers: Vec<String>,
         #[serde(default)]
         source: CommandExecutionSource,
         status: CommandExecutionStatus,
@@ -865,6 +870,8 @@ impl From<CoreTurnItem> for ThreadItem {
                 command: shlex_join(&command.command),
                 cwd: command.cwd.clone().into(),
                 process_id: command.process_id,
+                background_description: None,
+                background_triggers: Vec::new(),
                 source: command.source.into(),
                 status: command.status.into(),
                 command_actions: command_actions_for_path_uri(&command.parsed_cmd, &command.cwd),
@@ -1399,6 +1406,23 @@ pub struct TerminalInteractionNotification {
     pub item_id: String,
     pub process_id: String,
     pub stdin: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CommandExecutionBackgroundTriggerNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub process_id: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub declared_triggers: Vec<String>,
+    pub trigger: String,
+    pub reason: String,
+    #[serde(default)]
+    pub output_tail: String,
 }
 
 #[serde_as]

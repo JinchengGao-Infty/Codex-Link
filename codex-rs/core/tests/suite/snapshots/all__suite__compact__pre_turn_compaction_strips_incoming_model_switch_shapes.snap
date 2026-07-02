@@ -18,7 +18,7 @@ Scenario: Pre-turn compaction during model switch (without pre-sampling model-sw
 
 ## Local Post-Compaction History Layout
 00:message/user:BEFORE_SWITCH_USER
-01:message/user:<COMPACTION_SUMMARY>\nPRETURN_SWITCH_SUMMARY
+01:message/user:<codex_compacted_conversation_summary>\nThis block is an automat...
 02:message/developer[3]:
     [01] <model_switch>\nThe user was previously using a different model....
     [02] <PERMISSIONS_INSTRUCTIONS>

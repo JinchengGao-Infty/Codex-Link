@@ -6,6 +6,7 @@ use crate::protocol::v2::AgentMessageDeltaNotification;
 use crate::protocol::v2::CollabAgentState;
 use crate::protocol::v2::CollabAgentTool;
 use crate::protocol::v2::CollabAgentToolCallStatus;
+use crate::protocol::v2::CommandExecutionBackgroundTriggerNotification;
 use crate::protocol::v2::CommandExecutionOutputDeltaNotification;
 use crate::protocol::v2::DynamicToolCallOutputContentItem;
 use crate::protocol::v2::DynamicToolCallStatus;
@@ -451,6 +452,21 @@ pub fn item_event_to_server_notification(
                 stdin: terminal_event.stdin,
             })
         }
+        EventMsg::ExecBackgroundTrigger(trigger_event) => {
+            ServerNotification::CommandExecutionBackgroundTrigger(
+                CommandExecutionBackgroundTriggerNotification {
+                    thread_id,
+                    turn_id,
+                    item_id: trigger_event.call_id,
+                    process_id: trigger_event.process_id,
+                    description: trigger_event.description,
+                    declared_triggers: trigger_event.declared_triggers,
+                    trigger: trigger_event.trigger,
+                    reason: trigger_event.reason,
+                    output_tail: trigger_event.output_tail,
+                },
+            )
+        }
         EventMsg::ExecCommandEnd(exec_command_end_event) => {
             ServerNotification::ItemCompleted(ItemCompletedNotification {
                 thread_id,
@@ -469,6 +485,7 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::CollabResumeBeginEvent;
     use codex_protocol::protocol::CollabResumeEndEvent;
+    use codex_protocol::protocol::ExecBackgroundTriggerEvent;
     use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
     use codex_protocol::protocol::ExecOutputStream;
     use pretty_assertions::assert_eq;
@@ -607,5 +624,52 @@ mod tests {
                 delta: "hello".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn exec_background_trigger_maps_to_command_execution_background_trigger() {
+        let notification = item_event_to_server_notification(
+            EventMsg::ExecBackgroundTrigger(Box::new(ExecBackgroundTriggerEvent {
+                call_id: "call-1".to_string(),
+                process_id: "process-1".to_string(),
+                turn_id: "turn-event".to_string(),
+                triggered_at_ms: 1234,
+                command: vec!["python".to_string(), "train.py".to_string()],
+                cwd: "file:///tmp/project".parse().expect("valid file URI"),
+                description: Some("train until val_loss < 0.30".to_string()),
+                declared_triggers: vec![
+                    "metric_threshold val_loss < 0.30".to_string(),
+                    "plateau val_loss patience=10".to_string(),
+                ],
+                trigger: "metric_plateau".to_string(),
+                reason: "val_loss stalled for 10 epochs".to_string(),
+                output_tail: "epoch=48 val_loss=0.418\n".to_string(),
+            })),
+            "thread-1",
+            "turn-1",
+        );
+
+        match notification {
+            ServerNotification::CommandExecutionBackgroundTrigger(payload) => {
+                assert_eq!(
+                    payload,
+                    CommandExecutionBackgroundTriggerNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        item_id: "call-1".to_string(),
+                        process_id: "process-1".to_string(),
+                        description: Some("train until val_loss < 0.30".to_string()),
+                        declared_triggers: vec![
+                            "metric_threshold val_loss < 0.30".to_string(),
+                            "plateau val_loss patience=10".to_string(),
+                        ],
+                        trigger: "metric_plateau".to_string(),
+                        reason: "val_loss stalled for 10 epochs".to_string(),
+                        output_tail: "epoch=48 val_loss=0.418\n".to_string(),
+                    }
+                );
+            }
+            other => panic!("expected command execution background trigger, got {other:?}"),
+        }
     }
 }

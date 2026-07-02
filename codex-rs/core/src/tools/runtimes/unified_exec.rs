@@ -37,6 +37,7 @@ use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
+use crate::unified_exec::BackgroundOutputLog;
 use crate::unified_exec::NoopSpawnLifecycle;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcess;
@@ -80,6 +81,7 @@ pub struct UnifiedExecRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
+    pub background_output_log: Option<BackgroundOutputLog>,
 }
 
 /// Cache key for approval decisions that can be reused across equivalent
@@ -437,6 +439,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                             req.tty,
                             prepared.spawn_lifecycle,
                             req.turn_environment.environment.as_ref(),
+                            req.background_output_log.clone(),
                         )
                         .await
                         .map_err(|err| match err {
@@ -482,6 +485,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 req.tty,
                 Box::new(NoopSpawnLifecycle),
                 req.turn_environment.environment.as_ref(),
+                req.background_output_log.clone(),
             )
             .await
     }
@@ -583,6 +587,7 @@ mod tests {
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
+            background_output_log: None,
         };
 
         assert_eq!(
@@ -682,6 +687,7 @@ mod tests {
             additional_permissions_preapproved: false,
             justification: None,
             exec_approval_requirement,
+            background_output_log: None,
         }
     }
 

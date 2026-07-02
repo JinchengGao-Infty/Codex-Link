@@ -24,6 +24,16 @@ pub trait ToolOutput: Send {
         false
     }
 
+    /// Whether recording this tool output should satisfy the model turn without
+    /// another sampling request.
+    ///
+    /// This is for tools that detach durable local work, such as a background
+    /// terminal supervised by the harness. Ordinary tools should keep the
+    /// default so the model sees the result before continuing.
+    fn ends_turn_after_record(&self) -> bool {
+        false
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
 
     /// Returns the tool call id exposed to `PostToolUse` hooks for this output.
@@ -66,6 +76,10 @@ where
 
     fn contains_external_context(&self) -> bool {
         (**self).contains_external_context()
+    }
+
+    fn ends_turn_after_record(&self) -> bool {
+        (**self).ends_turn_after_record()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

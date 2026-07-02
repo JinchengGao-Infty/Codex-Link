@@ -118,6 +118,7 @@ async fn exec_command_with_tty(
                     .expect("turn environment")
                     .environment
                     .as_ref(),
+                None,
             )
             .await?,
     );
@@ -135,6 +136,8 @@ async fn exec_command_with_tty(
             hook_command: cmd.to_string(),
             tty,
             network_approval: None,
+            background_description: None,
+            background_triggers: Vec::new(),
             session: Arc::downgrade(session),
             last_used: started_at,
         };
@@ -198,7 +201,385 @@ async fn exec_command_with_tty(
         exit_code,
         original_token_count: Some(approx_token_count(&text)),
         hook_command: Some(cmd.to_string()),
+        background: None,
+        end_turn_after_record: false,
     })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_regex_trigger_emits_event_from_streaming_watcher() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let log_dir = tempfile::TempDir::new()?;
+    let background_log_path = log_dir.path().join("exec-bg-trigger.log");
+    let command = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        "sleep 0.5; printf 'warming up\\n'; sleep 0.1; printf 'CUDA out of memory\\n'; sleep 1"
+            .to_string(),
+    ];
+    let triggers = vec!["regex:CUDA out of memory".to_string()];
+    let background_trigger_policy = BackgroundTriggerPolicy::parse_declared(&triggers)
+        .map_err(anyhow::Error::msg)?
+        .expect("regex trigger should create executable policy");
+    #[allow(deprecated)]
+    let cwd = turn.cwd.clone().into();
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "call-bg-trigger".to_string(),
+    );
+
+    let response = manager
+        .exec_command(
+            ExecCommandRequest {
+                command: command.clone(),
+                shell_type: crate::shell::ShellType::Sh,
+                hook_command: command.join(" "),
+                process_id,
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                cwd,
+                #[allow(deprecated)]
+                sandbox_cwd: turn.cwd.clone().into(),
+                turn_environment: turn
+                    .environments
+                    .primary()
+                    .cloned()
+                    .expect("primary environment"),
+                shell_mode: codex_tools::UnifiedExecShellMode::Direct,
+                network: None,
+                tty: true,
+                sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                additional_permissions_preapproved: false,
+                justification: None,
+                prefix_rule: None,
+                background_description: Some("watch training for OOM".to_string()),
+                background_triggers: triggers.clone(),
+                background_trigger_policy: Some(background_trigger_policy),
+                background_log_path: Some(background_log_path.clone()),
+                background_declared: true,
+                end_turn_after_record: true,
+            },
+            &context,
+        )
+        .await?;
+
+    let trigger_event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = rx_event.recv().await.expect("event channel open");
+            if let codex_protocol::protocol::EventMsg::ExecBackgroundTrigger(trigger_event) =
+                event.msg
+            {
+                return trigger_event;
+            }
+        }
+    })
+    .await?;
+
+    assert_eq!(trigger_event.call_id, "call-bg-trigger");
+    assert_eq!(trigger_event.process_id, process_id.to_string());
+    assert_eq!(trigger_event.trigger, "regex:CUDA out of memory");
+    assert!(trigger_event.output_tail.contains("CUDA out of memory"));
+    let log_text = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let log_text = tokio::fs::read_to_string(&background_log_path)
+                .await
+                .unwrap_or_default();
+            if log_text.contains("CUDA out of memory") {
+                return log_text;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+    assert!(
+        log_text.contains("warming up"),
+        "background log should include output emitted before the trigger: {log_text:?}"
+    );
+    assert!(log_text.contains("CUDA out of memory"));
+
+    if let Some(process_id) = response.process_id {
+        assert!(session.terminate_background_terminal(process_id).await);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_log_records_initial_output() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn, _rx_event) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let log_dir = tempfile::TempDir::new()?;
+    let background_log_path = log_dir.path().join("exec-bg-initial-output.log");
+    let command = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        "printf 'first line\\n'; sleep 0.2; printf 'second line\\n'; sleep 1".to_string(),
+    ];
+    #[allow(deprecated)]
+    let cwd = turn.cwd.clone().into();
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "call-bg-log".to_string(),
+    );
+
+    let response = manager
+        .exec_command(
+            ExecCommandRequest {
+                command: command.clone(),
+                shell_type: crate::shell::ShellType::Sh,
+                hook_command: command.join(" "),
+                process_id,
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                cwd,
+                #[allow(deprecated)]
+                sandbox_cwd: turn.cwd.clone().into(),
+                turn_environment: turn
+                    .environments
+                    .primary()
+                    .cloned()
+                    .expect("primary environment"),
+                shell_mode: codex_tools::UnifiedExecShellMode::Direct,
+                network: None,
+                tty: true,
+                sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                additional_permissions_preapproved: false,
+                justification: None,
+                prefix_rule: None,
+                background_description: Some("record early output".to_string()),
+                background_triggers: Vec::new(),
+                background_trigger_policy: None,
+                background_log_path: Some(background_log_path.clone()),
+                background_declared: true,
+                end_turn_after_record: true,
+            },
+            &context,
+        )
+        .await?;
+
+    let log_text = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let log_text = tokio::fs::read_to_string(&background_log_path)
+                .await
+                .unwrap_or_default();
+            if log_text.contains("second line") {
+                return log_text;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+    assert!(
+        log_text.contains("first line"),
+        "background log should include output emitted immediately after spawn: {log_text:?}"
+    );
+    assert!(log_text.contains("second line"));
+
+    if let Some(process_id) = response.process_id {
+        assert!(session.terminate_background_terminal(process_id).await);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_exit_emits_event_without_stdin_poll() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let command = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        "sleep 1; printf 'training done\\n'".to_string(),
+    ];
+    #[allow(deprecated)]
+    let cwd = turn.cwd.clone().into();
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "call-bg-exit".to_string(),
+    );
+
+    let response = manager
+        .exec_command(
+            ExecCommandRequest {
+                command: command.clone(),
+                shell_type: crate::shell::ShellType::Sh,
+                hook_command: command.join(" "),
+                process_id,
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                cwd,
+                #[allow(deprecated)]
+                sandbox_cwd: turn.cwd.clone().into(),
+                turn_environment: turn
+                    .environments
+                    .primary()
+                    .cloned()
+                    .expect("primary environment"),
+                shell_mode: codex_tools::UnifiedExecShellMode::Direct,
+                network: None,
+                tty: true,
+                sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                additional_permissions_preapproved: false,
+                justification: None,
+                prefix_rule: None,
+                background_description: Some("watch training completion".to_string()),
+                background_triggers: vec!["on_exit".to_string()],
+                background_trigger_policy: None,
+                background_log_path: None,
+                background_declared: true,
+                end_turn_after_record: true,
+            },
+            &context,
+        )
+        .await?;
+    assert_eq!(response.process_id, Some(process_id));
+
+    let trigger_event = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = rx_event.recv().await.expect("event channel open");
+            if let codex_protocol::protocol::EventMsg::ExecBackgroundTrigger(trigger_event) =
+                event.msg
+                && trigger_event.trigger == "on_exit"
+            {
+                return trigger_event;
+            }
+        }
+    })
+    .await?;
+
+    assert_eq!(trigger_event.call_id, "call-bg-exit");
+    assert_eq!(trigger_event.process_id, process_id.to_string());
+    assert_eq!(trigger_event.reason, "process exited with code 0");
+    assert!(trigger_event.output_tail.contains("training done"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_detached_short_yield_session_exit_does_not_emit_background_trigger()
+-> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let command = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        "sleep 1.2; printf 'interactive done\\n'".to_string(),
+    ];
+    #[allow(deprecated)]
+    let cwd = turn.cwd.clone().into();
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "call-short-yield".to_string(),
+    );
+
+    let response = manager
+        .exec_command(
+            ExecCommandRequest {
+                command: command.clone(),
+                shell_type: crate::shell::ShellType::Sh,
+                hook_command: command.join(" "),
+                process_id,
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                cwd,
+                #[allow(deprecated)]
+                sandbox_cwd: turn.cwd.clone().into(),
+                turn_environment: turn
+                    .environments
+                    .primary()
+                    .cloned()
+                    .expect("primary environment"),
+                shell_mode: codex_tools::UnifiedExecShellMode::Direct,
+                network: None,
+                tty: true,
+                sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                additional_permissions_preapproved: false,
+                justification: None,
+                prefix_rule: None,
+                background_description: Some(
+                    "Auto-backgrounded if still running after the foreground wait".to_string(),
+                ),
+                background_triggers: vec!["on_exit".to_string()],
+                background_trigger_policy: None,
+                background_log_path: None,
+                background_declared: false,
+                end_turn_after_record: false,
+            },
+            &context,
+        )
+        .await?;
+    assert!(
+        response.process_id.is_some(),
+        "short-yield command should return a live process id"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = rx_event.recv().await.expect("event channel open");
+            match event.msg {
+                codex_protocol::protocol::EventMsg::ExecBackgroundTrigger(trigger_event)
+                    if trigger_event.call_id == "call-short-yield" =>
+                {
+                    anyhow::bail!(
+                        "non-detached short-yield session emitted background trigger: {trigger_event:?}"
+                    );
+                }
+                codex_protocol::protocol::EventMsg::ExecCommandEnd(event)
+                    if event.call_id == "call-short-yield" =>
+                {
+                    assert_eq!(event.exit_code, 0);
+                    assert!(event.aggregated_output.contains("interactive done"));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+
+    let late_background_trigger = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let event = rx_event.recv().await.expect("event channel open");
+            if let codex_protocol::protocol::EventMsg::ExecBackgroundTrigger(trigger_event) =
+                event.msg
+                && trigger_event.call_id == "call-short-yield"
+            {
+                return Some(trigger_event);
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(
+        late_background_trigger.is_none(),
+        "non-detached short-yield session emitted late background trigger: {late_background_trigger:?}"
+    );
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -287,14 +668,17 @@ async fn blocking_terminate_unified_process(
 ) -> anyhow::Result<Arc<UnifiedExecProcess>> {
     let (wake_tx, _wake_rx) = watch::channel(0);
     Ok(Arc::new(
-        UnifiedExecProcess::from_exec_server_started(StartedExecProcess {
-            process: Arc::new(BlockingTerminateExecProcess {
-                process_id: process_id.to_string().into(),
-                terminate_started,
-                allow_terminate,
-                wake_tx,
-            }),
-        })
+        UnifiedExecProcess::from_exec_server_started(
+            StartedExecProcess {
+                process: Arc::new(BlockingTerminateExecProcess {
+                    process_id: process_id.to_string().into(),
+                    terminate_started,
+                    allow_terminate,
+                    wake_tx,
+                }),
+            },
+            None,
+        )
         .await?,
     ))
 }
@@ -371,6 +755,8 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
             process_id: process_id.to_string(),
             command: "bash -i".to_string(),
             cwd: cwd.into(),
+            background_description: None,
+            background_triggers: Vec::new(),
         }]
     );
 
@@ -679,6 +1065,8 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             hook_command: "sleep 60".to_string(),
             tty: true,
             network_approval: None,
+            background_description: None,
+            background_triggers: Vec::new(),
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
         },
@@ -752,6 +1140,8 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             hook_command: "sleep 60".to_string(),
             tty: true,
             network_approval: None,
+            background_description: None,
+            background_triggers: Vec::new(),
             session: Arc::downgrade(&session),
             last_used,
         },
@@ -815,6 +1205,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             /*tty*/ false,
             Box::new(NoopSpawnLifecycle),
             &environment,
+            None,
         )
         .await?;
 
@@ -855,6 +1246,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
             /*tty*/ true,
             Box::new(NoopSpawnLifecycle),
             remote_test_env.environment(),
+            None,
         )
         .await?;
 
@@ -916,6 +1308,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
                 .expect("turn environment")
                 .environment
                 .as_ref(),
+            None,
         )
         .await
         .expect_err("expected inherited fd rejection");

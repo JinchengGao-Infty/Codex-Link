@@ -173,6 +173,17 @@ fn collect_user_messages_filters_legacy_warnings() {
 }
 
 #[test]
+fn summary_message_detection_accepts_new_and_legacy_prefixes() {
+    assert!(is_summary_message(&format_compaction_summary(
+        "summary text"
+    )));
+    assert!(is_summary_message(&format!(
+        "{LEGACY_SUMMARY_PREFIX}\nsummary text"
+    )));
+    assert!(!is_summary_message("ordinary user message"));
+}
+
+#[test]
 fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     // Use a small truncation limit so the test remains fast while still validating
     // that oversized user content is truncated.
@@ -357,6 +368,99 @@ async fn process_compacted_history_reinjects_full_initial_context() {
 }
 
 #[tokio::test]
+async fn process_compacted_history_reinjects_link_context_capsule() {
+    let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    codex_link_context_extension::install(&mut builder);
+    session.services.extensions = Arc::new(builder.build());
+    session
+        .services
+        .thread_extension_data
+        .insert(codex_link_context_extension::LinkContextState {
+            active_goal: Some("compact must preserve Link state".to_string()),
+            next_action: Some("continue with the task ledger".to_string()),
+            verified_evidence: vec!["capsule comes from extension state".to_string()],
+            ..codex_link_context_extension::LinkContextState::default()
+        });
+    let turn_context = Arc::new(turn_context);
+    let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
+    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
+
+    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+        &session,
+        &turn_context,
+        vec![user_message("summary")],
+        &initial_context_injection,
+    )
+    .await;
+
+    assert!(
+        refreshed.iter().any(|item| {
+            let ResponseItem::Message { role, content, .. } = item else {
+                return false;
+            };
+            role == "user"
+                && content_items_to_text(content).is_some_and(|text| {
+                    text.contains("<codex_link_context_capsule>")
+                        && text.contains("compact must preserve Link state")
+                        && text.contains("continue with the task ledger")
+                })
+        }),
+        "expected compacted history refresh to include Link capsule, got {refreshed:?}"
+    );
+}
+
+#[tokio::test]
+async fn process_compacted_history_reinjects_goal_backed_link_context_capsule() {
+    let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let goal_state_dir = tempfile::tempdir().expect("create goal state dir");
+    let goal_state =
+        codex_state::StateRuntime::init(goal_state_dir.path().to_path_buf(), "test".to_string())
+            .await
+            .expect("goal state should initialize");
+    goal_state
+        .thread_goals()
+        .replace_thread_goal(
+            session.thread_id,
+            "keep goal visible after compact",
+            codex_state::ThreadGoalStatus::Active,
+            Some(24_000),
+        )
+        .await
+        .expect("goal should be created");
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    codex_link_context_extension::install_with_goal_state(&mut builder, goal_state);
+    session.services.extensions = Arc::new(builder.build());
+    let turn_context = Arc::new(turn_context);
+    let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
+    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
+
+    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+        &session,
+        &turn_context,
+        vec![user_message("summary")],
+        &initial_context_injection,
+    )
+    .await;
+
+    assert!(
+        refreshed.iter().any(|item| {
+            let ResponseItem::Message { role, content, .. } = item else {
+                return false;
+            };
+            role == "user"
+                && content_items_to_text(content).is_some_and(|text| {
+                    text.contains("<codex_link_context_capsule>")
+                        && text.contains("keep goal visible after compact")
+                        && text.contains("Goal status: active")
+                        && text.contains("Goal usage: 0 / 24000 tokens")
+                })
+        }),
+        "expected compacted history refresh to include goal-backed Link capsule, got {refreshed:?}"
+    );
+}
+
+#[tokio::test]
 async fn process_compacted_history_drops_non_user_content_messages() {
     let compacted_history = vec![
         ResponseItem::Message {
@@ -476,7 +580,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
+                text: format_compaction_summary("summary text"),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
@@ -511,7 +615,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
+                text: format_compaction_summary("summary text"),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
@@ -600,7 +704,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
+                text: format_compaction_summary("summary text"),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
@@ -650,7 +754,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
+                text: format_compaction_summary("summary text"),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,

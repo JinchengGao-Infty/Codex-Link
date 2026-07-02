@@ -86,7 +86,13 @@ pub async fn user_input_or_turn(
     op: Op,
     client_user_message_id: Option<String>,
 ) {
-    user_input_or_turn_inner(sess, sub_id, op, client_user_message_id).await;
+    Box::pin(user_input_or_turn_inner(
+        sess,
+        sub_id,
+        op,
+        client_user_message_id,
+    ))
+    .await;
 }
 
 pub async fn update_thread_settings(
@@ -755,8 +761,13 @@ pub(super) async fn submission_loop(
                     false
                 }
                 Op::UserInput { .. } => {
-                    user_input_or_turn(&sess, sub.id.clone(), sub.op, sub.client_user_message_id)
-                        .await;
+                    Box::pin(user_input_or_turn(
+                        &sess,
+                        sub.id.clone(),
+                        sub.op,
+                        sub.client_user_message_id,
+                    ))
+                    .await;
                     false
                 }
                 Op::ThreadSettings { thread_settings } => {

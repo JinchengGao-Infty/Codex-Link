@@ -2,7 +2,7 @@ use core_test_support::test_codex::local_selections;
 use std::fs;
 
 use anyhow::Result;
-use codex_core::compact::SUMMARY_PREFIX;
+use codex_core::compact::format_compaction_summary;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuth;
@@ -140,7 +140,7 @@ const TEST_AGENT_IDENTITY_PRIVATE_KEY: &str =
     "MC4CAQAwBQYDK2VwBCIEIJ7kFBaOujmoz1gvBNEC+BeM2IX87FFB0xmISOZ/XO0c";
 
 fn summary_with_prefix(summary: &str) -> String {
-    format!("{SUMMARY_PREFIX}\n{summary}")
+    format_compaction_summary(summary)
 }
 
 fn context_snapshot_options() -> ContextSnapshotOptions {

@@ -96,6 +96,7 @@ enum RecordedToolLifecycle {
         call_id: String,
         tool_name: codex_tools::ToolName,
         outcome: codex_extension_api::ToolCallOutcome,
+        output_preview: Option<String>,
     },
 }
 
@@ -130,6 +131,7 @@ impl codex_extension_api::ToolLifecycleContributor for ToolLifecycleRecorder {
             call_id: input.call_id.to_string(),
             tool_name: input.tool_name.clone(),
             outcome: input.outcome,
+            output_preview: input.output_preview.map(str::to_string),
         };
         Box::pin(async move {
             records
@@ -429,6 +431,7 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
             call_id: "ok-call".to_string(),
             tool_name: ok_tool,
             outcome: codex_extension_api::ToolCallOutcome::Completed { success: false },
+            output_preview: Some("ok".to_string()),
         },
         RecordedToolLifecycle::Start {
             call_id: "failing-call".to_string(),
@@ -440,6 +443,7 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
             outcome: codex_extension_api::ToolCallOutcome::Failed {
                 handler_executed: true,
             },
+            output_preview: None,
         },
     ];
     let actual = records

@@ -28,6 +28,7 @@ use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use codex_utils_pty::SpawnedPty;
 
+use super::BackgroundOutputLog;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
@@ -63,6 +64,24 @@ pub(crate) struct OutputHandles {
     pub(crate) output_closed: Arc<AtomicBool>,
     pub(crate) output_closed_notify: Arc<Notify>,
     pub(crate) cancellation_token: CancellationToken,
+}
+
+async fn record_output_chunk(
+    output_buffer: &OutputBuffer,
+    output_tx: &broadcast::Sender<Vec<u8>>,
+    output_notify: &Arc<Notify>,
+    background_output_log: Option<&BackgroundOutputLog>,
+    bytes: Vec<u8>,
+) {
+    {
+        let mut guard = output_buffer.lock().await;
+        guard.push_chunk(bytes.clone());
+    }
+    if let Some(log) = background_output_log {
+        log.append(&bytes).await;
+    }
+    let _ = output_tx.send(bytes);
+    output_notify.notify_waiters();
 }
 
 /// Transport-specific process handle used by unified exec.
@@ -318,6 +337,7 @@ impl UnifiedExecProcess {
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
         spawn_lifecycle: SpawnLifecycleHandle,
+        background_output_log: Option<BackgroundOutputLog>,
     ) -> Result<Self, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
@@ -338,6 +358,7 @@ impl UnifiedExecProcess {
             Arc::clone(&managed.output_closed),
             Arc::clone(&managed.output_closed_notify),
             managed.output_tx.clone(),
+            background_output_log,
         ));
 
         match exit_rx.try_recv() {
@@ -376,6 +397,7 @@ impl UnifiedExecProcess {
 
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
+        background_output_log: Option<BackgroundOutputLog>,
     ) -> Result<Self, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         let mut managed = Self::new(
@@ -389,6 +411,7 @@ impl UnifiedExecProcess {
             output_handles,
             managed.output_tx.clone(),
             managed.state_tx.clone(),
+            background_output_log,
         ));
 
         let mut state_rx = managed.state_rx.clone();
@@ -417,6 +440,7 @@ impl UnifiedExecProcess {
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
         state_tx: watch::Sender<ProcessState>,
+        background_output_log: Option<BackgroundOutputLog>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -491,11 +515,14 @@ impl UnifiedExecProcess {
                     } = response;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
                         let bytes = chunk.chunk.into_inner();
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
-                        drop(guard);
-                        let _ = output_tx.send(bytes);
-                        output_notify.notify_waiters();
+                        record_output_chunk(
+                            &output_buffer,
+                            &output_tx,
+                            &output_notify,
+                            background_output_log.as_ref(),
+                            bytes,
+                        )
+                        .await;
                     }
                     last_seq = last_seq.max(next_seq.saturating_sub(1));
                     if let Some(message) = failure {
@@ -534,11 +561,14 @@ impl UnifiedExecProcess {
                         }
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
-                        drop(guard);
-                        let _ = output_tx.send(bytes);
-                        output_notify.notify_waiters();
+                        record_output_chunk(
+                            &output_buffer,
+                            &output_tx,
+                            &output_notify,
+                            background_output_log.as_ref(),
+                            bytes,
+                        )
+                        .await;
                     }
                     ExecProcessEvent::Exited {
                         seq,
@@ -582,16 +612,20 @@ impl UnifiedExecProcess {
         output_closed: Arc<AtomicBool>,
         output_closed_notify: Arc<Notify>,
         output_tx: broadcast::Sender<Vec<u8>>,
+        background_output_log: Option<BackgroundOutputLog>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 match receiver.recv().await {
                     Ok(chunk) => {
-                        let mut guard = buffer.lock().await;
-                        guard.push_chunk(chunk.clone());
-                        drop(guard);
-                        let _ = output_tx.send(chunk);
-                        output_notify.notify_waiters();
+                        record_output_chunk(
+                            &buffer,
+                            &output_tx,
+                            &output_notify,
+                            background_output_log.as_ref(),
+                            chunk,
+                        )
+                        .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {

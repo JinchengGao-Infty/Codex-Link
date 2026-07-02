@@ -13,7 +13,7 @@ Scenario: Manual /compact with prior user history compacts existing history and 
 
 ## Local Post-Compaction History Layout
 00:message/user:first manual turn
-01:message/user:<COMPACTION_SUMMARY>\nFIRST_MANUAL_SUMMARY
+01:message/user:<codex_compacted_conversation_summary>\nThis block is an automat...
 02:message/developer:<PERMISSIONS_INSTRUCTIONS>
 03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
 04:message/user:second manual turn

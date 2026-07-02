@@ -435,6 +435,8 @@ fn exec_command_tool_output_formats_truncated_response() {
         exit_code: Some(0),
         original_token_count: Some(10),
         hook_command: None,
+        background: None,
+        end_turn_after_record: false,
     }
     .to_response_item("call-42", &payload);
 
@@ -460,4 +462,48 @@ fn exec_command_tool_output_formats_truncated_response() {
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
+}
+
+#[test]
+fn exec_command_tool_output_formats_background_metadata() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let response = ExecCommandToolOutput {
+        event_call_id: "call-43".to_string(),
+        chunk_id: "def456".to_string(),
+        wall_time: std::time::Duration::from_millis(1000),
+        raw_output: b"training started".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: None,
+        process_id: Some(1234),
+        exit_code: None,
+        original_token_count: Some(2),
+        hook_command: Some("python train.py".to_string()),
+        background: Some(ExecBackgroundMetadata {
+            description: "train model until val_loss < 0.30".to_string(),
+            triggers: vec![
+                "on_exit".to_string(),
+                "metric_plateau: val_loss patience=10".to_string(),
+            ],
+            log_path: Some("/tmp/codex-link/jobs/exec-1234.log".into()),
+        }),
+        end_turn_after_record: true,
+    }
+    .to_response_item("call-43", &payload);
+
+    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        panic!("expected function-call output");
+    };
+    let text = output
+        .body
+        .to_text()
+        .expect("exec output should serialize as text");
+
+    assert!(text.contains("Background mode: true"));
+    assert!(text.contains("Background description: train model until val_loss < 0.30"));
+    assert!(text.contains("Background triggers: on_exit, metric_plateau: val_loss patience=10"));
+    assert!(text.contains("Background log: /tmp/codex-link/jobs/exec-1234.log"));
+    assert!(text.contains("Process running with session ID 1234"));
+    assert!(text.contains("native Codex unified_exec"));
 }

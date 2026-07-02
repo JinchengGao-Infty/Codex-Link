@@ -1,10 +1,14 @@
+use crate::agents_md::AgentsMdFocusPath;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_context::TurnEnvironment;
+use crate::stream_events_utils::apply_turn_item_contributors;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_apply_patch::AppliedPatchDelta;
+use codex_apply_patch::AppliedPatchFileChange;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -23,10 +27,14 @@ use codex_shell_command::parse_command::parse_command;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use super::format_exec_output_str;
+
+const APPLY_PATCH_AGENTS_MD_FOCUS_PATH_MAX: usize = 32;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ToolEventCtx<'a> {
@@ -93,6 +101,7 @@ fn tracker_update_for_known_delta<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_exec_command_begin(
     ctx: ToolEventCtx<'_>,
     command: &[String],
@@ -101,6 +110,8 @@ pub(crate) async fn emit_exec_command_begin(
     source: ExecCommandSource,
     interaction_input: Option<String>,
     process_id: Option<&str>,
+    background_description: Option<&str>,
+    background_triggers: &[String],
 ) {
     ctx.session
         .send_event(
@@ -115,10 +126,19 @@ pub(crate) async fn emit_exec_command_begin(
                 parsed_cmd: parsed_cmd.to_vec(),
                 source,
                 interaction_input,
+                background_description: background_description.map(str::to_owned),
+                background_triggers: background_triggers.to_vec(),
             }),
         )
         .await;
 }
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UnifiedExecBackgroundMetadata {
+    pub(crate) description: Option<String>,
+    pub(crate) triggers: Vec<String>,
+}
+
 // Concrete, allocation-free emitter: avoid trait objects and boxed futures.
 pub(crate) enum ToolEmitter {
     Shell {
@@ -138,6 +158,7 @@ pub(crate) enum ToolEmitter {
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
         process_id: Option<String>,
+        background_metadata: UnifiedExecBackgroundMetadata,
     },
 }
 
@@ -170,6 +191,22 @@ impl ToolEmitter {
         source: ExecCommandSource,
         process_id: Option<String>,
     ) -> Self {
+        Self::unified_exec_with_background_metadata(
+            command,
+            cwd,
+            source,
+            process_id,
+            UnifiedExecBackgroundMetadata::default(),
+        )
+    }
+
+    pub(crate) fn unified_exec_with_background_metadata(
+        command: &[String],
+        cwd: PathUri,
+        source: ExecCommandSource,
+        process_id: Option<String>,
+        background_metadata: UnifiedExecBackgroundMetadata,
+    ) -> Self {
         let parsed_cmd = parse_command(command);
         Self::UnifiedExec {
             command: command.to_vec(),
@@ -177,6 +214,7 @@ impl ToolEmitter {
             source,
             parsed_cmd,
             process_id,
+            background_metadata,
         }
     }
 
@@ -195,8 +233,14 @@ impl ToolEmitter {
                 emit_exec_stage(
                     ctx,
                     ExecCommandInput::new(
-                        command, cwd, parsed_cmd, *source, /*interaction_input*/ None,
+                        command,
+                        cwd,
+                        parsed_cmd,
+                        *source,
+                        /*interaction_input*/ None,
                         /*process_id*/ None,
+                        /*background_description*/ None,
+                        /*background_triggers*/ &[],
                     ),
                     stage,
                 )
@@ -318,6 +362,7 @@ impl ToolEmitter {
                     source,
                     parsed_cmd,
                     process_id,
+                    background_metadata,
                 },
                 stage,
             ) => {
@@ -330,6 +375,8 @@ impl ToolEmitter {
                         *source,
                         /*interaction_input*/ None,
                         process_id.as_deref(),
+                        background_metadata.description.as_deref(),
+                        &background_metadata.triggers,
                     ),
                     stage,
                 )
@@ -438,9 +485,12 @@ struct ExecCommandInput<'a> {
     source: ExecCommandSource,
     interaction_input: Option<&'a str>,
     process_id: Option<&'a str>,
+    background_description: Option<&'a str>,
+    background_triggers: &'a [String],
 }
 
 impl<'a> ExecCommandInput<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         command: &'a [String],
         cwd: &'a PathUri,
@@ -448,6 +498,8 @@ impl<'a> ExecCommandInput<'a> {
         source: ExecCommandSource,
         interaction_input: Option<&'a str>,
         process_id: Option<&'a str>,
+        background_description: Option<&'a str>,
+        background_triggers: &'a [String],
     ) -> Self {
         Self {
             command,
@@ -456,6 +508,8 @@ impl<'a> ExecCommandInput<'a> {
             source,
             interaction_input,
             process_id,
+            background_description,
+            background_triggers,
         }
     }
 }
@@ -485,6 +539,8 @@ async fn emit_exec_stage(
                 exec_input.source,
                 exec_input.interaction_input.map(str::to_owned),
                 exec_input.process_id,
+                exec_input.background_description,
+                exec_input.background_triggers,
             )
             .await;
         }
@@ -575,19 +631,31 @@ async fn emit_patch_end(
     status: PatchApplyStatus,
     tracker_update: TurnDiffTrackerUpdate<'_>,
 ) {
-    ctx.session
-        .emit_turn_item_completed(
-            ctx.turn,
-            TurnItem::FileChange(FileChangeItem {
-                id: ctx.call_id.to_string(),
-                changes,
-                status: Some(status),
-                auto_approved: None,
-                stdout: Some(stdout),
-                stderr: Some(stderr),
-            }),
-        )
-        .await;
+    let mut item = TurnItem::FileChange(FileChangeItem {
+        id: ctx.call_id.to_string(),
+        changes,
+        status: Some(status),
+        auto_approved: None,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+    });
+    apply_turn_item_contributors(ctx.session, ctx.turn.extension_data.as_ref(), &mut item).await;
+
+    ctx.session.emit_turn_item_completed(ctx.turn, item).await;
+
+    if let TurnDiffTrackerUpdate::Track {
+        environment_id,
+        delta,
+    } = &tracker_update
+    {
+        let focus_paths =
+            agents_md_focus_paths_for_patch_delta(ctx.turn, environment_id.as_deref(), delta);
+        ctx.session
+            .services
+            .agents_md_manager
+            .add_focus_paths(&ctx.turn.config, &ctx.turn.environments, focus_paths)
+            .await;
+    }
 
     if let Some(tracker) = ctx.turn_diff_tracker {
         let (should_emit_turn_diff, unified_diff) = {
@@ -621,6 +689,78 @@ async fn emit_patch_end(
     }
 }
 
+fn agents_md_focus_paths_for_patch_delta(
+    turn: &TurnContext,
+    environment_id: Option<&str>,
+    delta: &AppliedPatchDelta,
+) -> Vec<AgentsMdFocusPath> {
+    let Some(environment) = patch_environment(turn, environment_id) else {
+        return Vec::new();
+    };
+    let mut focus_paths = Vec::new();
+    let mut seen = HashSet::new();
+    for change in delta.changes() {
+        push_patch_focus_path(
+            environment,
+            change.path.as_path(),
+            &mut focus_paths,
+            &mut seen,
+        );
+        if let AppliedPatchFileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } = &change.change
+        {
+            push_patch_focus_path(
+                environment,
+                move_path.as_path(),
+                &mut focus_paths,
+                &mut seen,
+            );
+        }
+        if focus_paths.len() >= APPLY_PATCH_AGENTS_MD_FOCUS_PATH_MAX {
+            break;
+        }
+    }
+    focus_paths
+}
+
+fn patch_environment<'a>(
+    turn: &'a TurnContext,
+    environment_id: Option<&str>,
+) -> Option<&'a TurnEnvironment> {
+    match environment_id {
+        Some(environment_id) => turn
+            .environments
+            .turn_environments
+            .iter()
+            .find(|environment| environment.environment_id == environment_id),
+        None => turn.environments.primary(),
+    }
+}
+
+fn push_patch_focus_path(
+    environment: &TurnEnvironment,
+    path: &Path,
+    focus_paths: &mut Vec<AgentsMdFocusPath>,
+    seen: &mut HashSet<AgentsMdFocusPath>,
+) {
+    if focus_paths.len() >= APPLY_PATCH_AGENTS_MD_FOCUS_PATH_MAX {
+        return;
+    }
+    let path = path.to_string_lossy();
+    let Ok(path) = environment.cwd().join(path.as_ref()) else {
+        return;
+    };
+    let focus_path = AgentsMdFocusPath {
+        environment_id: environment.environment_id.clone(),
+        path,
+    };
+    if seen.insert(focus_path.clone()) {
+        focus_paths.push(focus_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +773,7 @@ mod tests {
     use codex_protocol::items::TurnItem;
     use codex_protocol::protocol::PatchApplyStatus;
     use codex_utils_path_uri::PathUri;
+    use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
@@ -815,5 +956,44 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn patch_delta_focus_paths_include_moved_destination() {
+        let (_session, turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let dir = tempdir().expect("tempdir");
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute cwd");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+        std::fs::write(dir.path().join("src/original.txt"), "before\n").expect("write original");
+        let delta = codex_apply_patch::apply_patch(
+            "*** Begin Patch\n*** Update File: src/original.txt\n*** Move to: rules/moved.txt\n@@\n-before\n+after\n*** End Patch",
+            &cwd,
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .expect("apply patch");
+
+        let focus_paths =
+            agents_md_focus_paths_for_patch_delta(turn.as_ref(), Some("local"), &delta);
+
+        assert_eq!(
+            focus_paths,
+            vec![
+                AgentsMdFocusPath {
+                    environment_id: "local".to_string(),
+                    path: cwd.join("src/original.txt").expect("source path"),
+                },
+                AgentsMdFocusPath {
+                    environment_id: "local".to_string(),
+                    path: cwd.join("rules/moved.txt").expect("dest path"),
+                },
+            ]
+        );
     }
 }

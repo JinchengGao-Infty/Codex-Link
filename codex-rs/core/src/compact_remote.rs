@@ -138,9 +138,16 @@ async fn run_remote_compact_task_inner(
             return Err(error);
         }
     }
+    let (step_context, initial_context_injection) =
+        crate::compact::refresh_compaction_step_context(
+            sess,
+            step_context,
+            initial_context_injection,
+        )
+        .await;
     let result = run_remote_compact_task_inner_impl(
         sess,
-        step_context,
+        &step_context,
         turn_state,
         initial_context_injection,
         compaction_metadata,

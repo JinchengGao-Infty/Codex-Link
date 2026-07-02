@@ -161,6 +161,14 @@ struct ExecCommandBeginTracePayload<'a> {
     source: ExecCommandSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     interaction_input: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    background_description: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_empty_string_slice")]
+    background_triggers: &'a [String],
+}
+
+fn is_empty_string_slice(value: &[String]) -> bool {
+    value.is_empty()
 }
 
 impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
@@ -175,6 +183,8 @@ impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
             parsed_cmd,
             source,
             interaction_input,
+            background_description,
+            background_triggers,
         } = event;
         Self {
             call_id,
@@ -186,6 +196,8 @@ impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
             parsed_cmd,
             source: *source,
             interaction_input: interaction_input.as_deref(),
+            background_description: background_description.as_deref(),
+            background_triggers,
         }
     }
 }
@@ -374,6 +386,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ViewImageToolCall(_)
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::ExecCommandOutputDelta(_)
+        | EventMsg::ExecBackgroundTrigger(_)
         | EventMsg::TerminalInteraction(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::ExecApprovalRequest(_)
@@ -447,6 +460,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::ViewImageToolCall(_)
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::ExecCommandOutputDelta(_)
+        | EventMsg::ExecBackgroundTrigger(_)
         | EventMsg::TerminalInteraction(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::ExecApprovalRequest(_)

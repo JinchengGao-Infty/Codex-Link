@@ -197,6 +197,14 @@ impl ToolOutput for PostToolUseFeedbackOutput {
         self.original.success_for_logging()
     }
 
+    fn contains_external_context(&self) -> bool {
+        self.original.contains_external_context()
+    }
+
+    fn ends_turn_after_record(&self) -> bool {
+        self.original.ends_turn_after_record()
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         self.model_visible.to_response_item(call_id, payload)
     }
@@ -509,6 +517,7 @@ impl ToolRegistry {
                         &invocation,
                         terminal_outcome_reached.as_deref(),
                         ToolCallOutcome::Blocked,
+                        None,
                     )
                     .await;
                     return Err(err);
@@ -527,6 +536,7 @@ impl ToolRegistry {
                             ToolCallOutcome::Failed {
                                 handler_executed: false,
                             },
+                            None,
                         )
                         .await;
                         return Err(err);
@@ -622,10 +632,12 @@ impl ToolRegistry {
                 handler_executed: true,
             },
         };
+        let output_preview = result.as_ref().ok().map(|(preview, _)| preview.as_str());
         notify_tool_finish_if_unclaimed(
             &invocation,
             terminal_outcome_reached.as_deref(),
             lifecycle_outcome,
+            output_preview,
         )
         .await;
 
@@ -674,12 +686,13 @@ async fn notify_tool_finish_if_unclaimed(
     invocation: &ToolInvocation,
     terminal_outcome_reached: Option<&AtomicBool>,
     outcome: ToolCallOutcome,
+    output_preview: Option<&str>,
 ) -> bool {
     if terminal_outcome_reached.is_some_and(|reached| reached.swap(true, Ordering::AcqRel)) {
         return false;
     }
 
-    notify_tool_finish(invocation, outcome).await;
+    notify_tool_finish(invocation, outcome, output_preview).await;
     true
 }
 

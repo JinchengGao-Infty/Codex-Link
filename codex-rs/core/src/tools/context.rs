@@ -21,6 +21,7 @@ use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -320,6 +321,15 @@ pub struct ExecCommandToolOutput {
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
+    pub background: Option<ExecBackgroundMetadata>,
+    pub end_turn_after_record: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExecBackgroundMetadata {
+    pub description: String,
+    pub triggers: Vec<String>,
+    pub log_path: Option<PathBuf>,
 }
 
 impl ToolOutput for ExecCommandToolOutput {
@@ -329,6 +339,10 @@ impl ToolOutput for ExecCommandToolOutput {
 
     fn success_for_logging(&self) -> bool {
         true
+    }
+
+    fn ends_turn_after_record(&self) -> bool {
+        self.end_turn_after_record
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -421,6 +435,29 @@ impl ExecCommandToolOutput {
 
         if let Some(exit_code) = self.exit_code {
             sections.push(format!("Process exited with code {exit_code}"));
+        }
+
+        if let Some(background) = &self.background {
+            sections.push("Background mode: true".to_string());
+            sections.push(format!(
+                "Background description: {}",
+                background.description
+            ));
+            if !background.triggers.is_empty() {
+                sections.push(format!(
+                    "Background triggers: {}",
+                    background.triggers.join(", ")
+                ));
+            }
+            if let Some(log_path) = &background.log_path {
+                sections.push(format!("Background log: {}", log_path.display()));
+            }
+            if self.process_id.is_some() {
+                sections.push(
+                    "Background watcher: native Codex unified_exec is streaming output and will emit completion events; avoid repeated empty polling unless a status/tail check is needed."
+                        .to_string(),
+                );
+            }
         }
 
         if let Some(process_id) = &self.process_id {

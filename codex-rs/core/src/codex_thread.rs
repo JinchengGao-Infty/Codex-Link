@@ -171,6 +171,8 @@ pub struct BackgroundTerminalInfo {
     pub process_id: String,
     pub command: String,
     pub cwd: PathUri,
+    pub background_description: Option<String>,
+    pub background_triggers: Vec<String>,
 }
 
 /// Conduit for the bidirectional stream of messages that compose a thread

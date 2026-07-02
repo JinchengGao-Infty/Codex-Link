@@ -1905,6 +1905,8 @@ mod tests {
                 command: "echo 'hello world'".to_string(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".to_string()),
+                background_description: None,
+                background_triggers: Vec::new(),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
@@ -2508,6 +2510,8 @@ mod tests {
                 command: "echo 'hello world'".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".into()),
+                background_description: None,
+                background_triggers: Vec::new(),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
@@ -2753,6 +2757,8 @@ mod tests {
                 command: "ls".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-2".into()),
+                background_description: None,
+                background_triggers: Vec::new(),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
                 command_actions: vec![CommandAction::Unknown {
@@ -2851,6 +2857,8 @@ mod tests {
                 command: "rm -rf /tmp/guardian".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
+                background_description: None,
+                background_triggers: Vec::new(),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
                 command_actions: vec![CommandAction::Unknown {
@@ -2917,6 +2925,8 @@ mod tests {
                 command: "/bin/rm -f /tmp/file.sqlite".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
+                background_description: None,
+                background_triggers: Vec::new(),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::InProgress,
                 command_actions: vec![CommandAction::Unknown {
@@ -3015,6 +3025,8 @@ mod tests {
                 command: "echo done".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-42".into()),
+                background_description: None,
+                background_triggers: Vec::new(),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {

@@ -16,6 +16,7 @@ mod mcp;
 mod prompt;
 mod thread_lifecycle;
 mod tool_lifecycle;
+mod turn_event;
 mod turn_input;
 mod turn_lifecycle;
 mod world_state;
@@ -34,6 +35,8 @@ pub use tool_lifecycle::ToolCallSource;
 pub use tool_lifecycle::ToolFinishInput;
 pub use tool_lifecycle::ToolLifecycleFuture;
 pub use tool_lifecycle::ToolStartInput;
+pub use turn_event::TurnEventFuture;
+pub use turn_event::TurnEventInput;
 pub use turn_input::TurnInputContext;
 pub use turn_input::TurnInputEnvironment;
 pub use turn_lifecycle::TurnAbortInput;
@@ -146,6 +149,20 @@ pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
 
     /// Called before the host drops the thread runtime and thread-scoped store.
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let _self = self;
+            let _input = input;
+        })
+    }
+}
+
+/// Contributor for host-emitted turn events.
+///
+/// Implementations should filter aggressively and avoid expensive work on
+/// unrelated events. This hook is intended for lightweight bookkeeping or
+/// scheduling decisions derived from already-emitted host events.
+pub trait TurnEventContributor: Send + Sync {
+    fn on_turn_event<'a>(&'a self, input: TurnEventInput<'a>) -> TurnEventFuture<'a> {
         Box::pin(async move {
             let _self = self;
             let _input = input;

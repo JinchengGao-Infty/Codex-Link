@@ -1,4 +1,5 @@
 use super::*;
+use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -623,6 +624,113 @@ async fn total_byte_limit_truncates_later_project_docs() {
 }
 
 #[tokio::test]
+async fn agents_md_imports_referenced_files_in_source_order() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    fs::create_dir(repo.path().join("docs")).unwrap();
+    fs::write(
+        repo.path().join("AGENTS.md"),
+        "root doc\n@docs/rules.md\nafter import",
+    )
+    .unwrap();
+    fs::write(repo.path().join("docs/rules.md"), "imported rule").unwrap();
+
+    let loaded = load_agents_md(&make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await)
+        .await
+        .expect("project instructions");
+
+    let agents = repo.path().join("AGENTS.md").abs();
+    let imported = repo.path().join("docs/rules.md").abs();
+    let expected = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![
+            InstructionEntry {
+                contents: "root doc\n@docs/rules.md\nafter import".to_string(),
+                provenance: project_provenance(agents.clone(), repo.abs()),
+            },
+            InstructionEntry {
+                contents: "imported rule".to_string(),
+                provenance: project_provenance(imported.clone(), repo.abs()),
+            },
+        ],
+    };
+
+    assert_eq!(loaded, expected);
+    assert_eq!(
+        loaded.text(),
+        "root doc\n@docs/rules.md\nafter import\n\nimported rule"
+    );
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![
+            PathUri::from_abs_path(&agents),
+            PathUri::from_abs_path(&imported)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn agents_md_imports_recursively_and_ignores_code_references() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    fs::write(
+        repo.path().join("AGENTS.md"),
+        "\
+@a.md
+`@inline.md`
+```
+@fenced.md
+```",
+    )
+    .unwrap();
+    fs::write(repo.path().join("a.md"), "a rule\n@nested/b.md").unwrap();
+    fs::create_dir(repo.path().join("nested")).unwrap();
+    fs::write(repo.path().join("nested/b.md"), "b rule").unwrap();
+    fs::write(repo.path().join("inline.md"), "inline should be ignored").unwrap();
+    fs::write(repo.path().join("fenced.md"), "fenced should be ignored").unwrap();
+
+    let loaded = load_agents_md(&make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await)
+        .await
+        .expect("project instructions");
+    let text = loaded.text();
+
+    assert!(text.contains("a rule"));
+    assert!(text.contains("b rule"));
+    assert!(!text.contains("inline should be ignored"));
+    assert!(!text.contains("fenced should be ignored"));
+}
+
+#[tokio::test]
+async fn agents_md_imports_share_project_doc_byte_limit() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "a\n@b.md").unwrap();
+    fs::write(repo.path().join("b.md"), "123456").unwrap();
+
+    let loaded = load_agents_md(&make_config(&repo, /*limit*/ 10, /*instructions*/ None).await)
+        .await
+        .expect("project instructions");
+
+    assert_eq!(loaded.text(), "a\n@b.md\n\n123");
+}
+
+#[tokio::test]
+async fn agents_md_imports_do_not_escape_project_doc_root() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join(".git"), "").unwrap();
+    fs::write(repo.join("AGENTS.md"), "@../secret.md").unwrap();
+    fs::write(parent.path().join("secret.md"), "secret outside repo").unwrap();
+
+    let mut config = make_config(&parent, /*limit*/ 4096, /*instructions*/ None).await;
+    config.cwd = repo.abs();
+    let loaded = load_agents_md(&config).await.expect("project instructions");
+
+    assert_eq!(loaded.text(), "@../secret.md");
+}
+
+#[tokio::test]
 async fn read_agents_md_propagates_metadata_errors() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
@@ -634,9 +742,15 @@ async fn read_agents_md_propagates_metadata_errors() {
     };
 
     let cwd = config.cwd.clone();
-    let err = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
-        .await
-        .expect_err("metadata error");
+    let err = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&cwd),
+        /*focus_paths*/ &[],
+    )
+    .await
+    .expect_err("metadata error");
 
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 }
@@ -653,9 +767,15 @@ async fn read_agents_md_propagates_read_errors() {
     };
 
     let cwd = config.cwd.clone();
-    let err = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
-        .await
-        .expect_err("read error");
+    let err = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&cwd),
+        /*focus_paths*/ &[],
+    )
+    .await
+    .expect_err("read error");
 
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 }
@@ -672,9 +792,15 @@ async fn read_agents_md_ignores_files_removed_after_discovery() {
     };
 
     let cwd = config.cwd.clone();
-    let loaded = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
-        .await
-        .expect("removed file is recoverable");
+    let loaded = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&cwd),
+        /*focus_paths*/ &[],
+    )
+    .await
+    .expect("removed file is recoverable");
 
     assert_eq!(loaded, None);
 }
@@ -1161,6 +1287,168 @@ async fn concatenates_root_and_cwd_docs() {
             PathUri::from_abs_path(&root_agents),
             PathUri::from_abs_path(&crate_agents),
         ]
+    );
+}
+
+#[tokio::test]
+async fn focus_path_loads_nested_agents_md_when_cwd_is_repo_root() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "root doc").unwrap();
+    let tui_dir = repo.path().join("codex-rs/tui");
+    fs::create_dir_all(tui_dir.join("src")).unwrap();
+    fs::write(tui_dir.join("AGENTS.md"), "tui doc").unwrap();
+    fs::write(tui_dir.join("src/app.rs"), "fn main() {}\n").unwrap();
+
+    let cfg = make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await;
+    let environments = resolved_local_environments([("local", cfg.cwd.clone())]);
+    let focus_paths = vec![AgentsMdFocusPath {
+        environment_id: "local".to_string(),
+        path: PathUri::from_abs_path(&tui_dir.join("src/app.rs").abs()),
+    }];
+
+    let loaded = load_project_instructions_with_focus_paths(
+        &cfg.config,
+        /*user_instructions*/ None,
+        &environments,
+        &focus_paths,
+    )
+    .await
+    .expect("doc expected");
+    let root_agents = repo.path().join("AGENTS.md").abs();
+    let tui_agents = tui_dir.join("AGENTS.md").abs();
+    let expected = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![
+            InstructionEntry {
+                contents: "root doc".to_string(),
+                provenance: project_provenance(root_agents.clone(), cfg.cwd.clone()),
+            },
+            InstructionEntry {
+                contents: "tui doc".to_string(),
+                provenance: project_provenance(tui_agents.clone(), cfg.cwd.clone()),
+            },
+        ],
+    };
+
+    assert_eq!(loaded, expected);
+    assert_eq!(loaded.text(), "root doc\n\ntui doc");
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![
+            PathUri::from_abs_path(&root_agents),
+            PathUri::from_abs_path(&tui_agents),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn focus_path_ignores_paths_outside_project_root() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "root doc").unwrap();
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    fs::write(outside.path().join("AGENTS.md"), "outside doc").unwrap();
+    fs::write(outside.path().join("lib.rs"), "fn outside() {}\n").unwrap();
+
+    let cfg = make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await;
+    let environments = resolved_local_environments([("local", cfg.cwd.clone())]);
+    let focus_paths = vec![AgentsMdFocusPath {
+        environment_id: "local".to_string(),
+        path: PathUri::from_abs_path(&outside.path().join("lib.rs").abs()),
+    }];
+
+    let loaded = load_project_instructions_with_focus_paths(
+        &cfg.config,
+        /*user_instructions*/ None,
+        &environments,
+        &focus_paths,
+    )
+    .await
+    .expect("doc expected");
+
+    assert_eq!(loaded.text(), "root doc");
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![PathUri::from_abs_path(&repo.path().join("AGENTS.md").abs())]
+    );
+}
+
+#[tokio::test]
+async fn focus_path_uses_parent_directory_for_missing_new_file() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "root doc").unwrap();
+    let crate_dir = repo.path().join("crates/link-context");
+    fs::create_dir_all(crate_dir.join("src")).unwrap();
+    fs::write(crate_dir.join("AGENTS.md"), "crate doc").unwrap();
+
+    let cfg = make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await;
+    let environments = resolved_local_environments([("local", cfg.cwd.clone())]);
+    let focus_paths = vec![AgentsMdFocusPath {
+        environment_id: "local".to_string(),
+        path: PathUri::from_abs_path(&crate_dir.join("src/new_file.rs").abs()),
+    }];
+
+    let loaded = load_project_instructions_with_focus_paths(
+        &cfg.config,
+        /*user_instructions*/ None,
+        &environments,
+        &focus_paths,
+    )
+    .await
+    .expect("doc expected");
+
+    assert_eq!(loaded.text(), "root doc\n\ncrate doc");
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![
+            PathUri::from_abs_path(&repo.path().join("AGENTS.md").abs()),
+            PathUri::from_abs_path(&crate_dir.join("AGENTS.md").abs()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn agents_md_manager_adds_focus_paths_incrementally() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "root doc").unwrap();
+    let crate_dir = repo.path().join("crates/link-context");
+    fs::create_dir_all(crate_dir.join("src")).unwrap();
+    fs::write(crate_dir.join("AGENTS.md"), "crate doc").unwrap();
+
+    let cfg = make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await;
+    let environments = resolved_local_environments([("local", cfg.cwd.clone())]);
+    let manager = AgentsMdManager::new(/*user_instructions*/ None);
+    manager.refresh(&cfg.config, &environments).await;
+    assert_eq!(
+        manager
+            .get_loaded()
+            .await
+            .expect("root doc expected")
+            .text(),
+        "root doc"
+    );
+
+    manager
+        .add_focus_paths(
+            &cfg.config,
+            &environments,
+            vec![AgentsMdFocusPath {
+                environment_id: "local".to_string(),
+                path: PathUri::from_abs_path(&crate_dir.join("src/lib.rs").abs()),
+            }],
+        )
+        .await;
+
+    assert_eq!(
+        manager
+            .get_loaded()
+            .await
+            .expect("focused doc expected")
+            .text(),
+        "root doc\n\ncrate doc"
     );
 }
 

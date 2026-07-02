@@ -15,6 +15,7 @@ use crate::responses_metadata::CompactionTurnMetadata;
 #[cfg(test)]
 use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
 use crate::util::backoff;
@@ -51,6 +52,12 @@ use codex_model_provider_info::ModelProviderInfo;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+pub const COMPACTED_SUMMARY_END: &str = "</codex_compacted_conversation_summary>";
+const LEGACY_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+
+pub fn format_compaction_summary(summary: &str) -> String {
+    format!("{SUMMARY_PREFIX}\n{summary}\n{COMPACTED_SUMMARY_END}")
+}
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -84,17 +91,68 @@ pub(crate) async fn build_compaction_initial_context(
     }
 }
 
+pub(crate) async fn refresh_compaction_step_context(
+    sess: &Arc<Session>,
+    step_context: &Arc<StepContext>,
+    initial_context_injection: InitialContextInjection,
+) -> (Arc<StepContext>, InitialContextInjection) {
+    let turn_context = Arc::clone(&step_context.turn);
+    sess.services
+        .agents_md_manager
+        .force_refresh(&turn_context.config, &step_context.environments)
+        .await;
+    let loaded_agents_md = sess.services.agents_md_manager.get_loaded().await;
+    let refreshed_step_context = Arc::new(StepContext::new(
+        turn_context,
+        step_context.environments.clone(),
+        step_context.selected_capability_roots.clone(),
+        Arc::clone(&step_context.mcp),
+        loaded_agents_md,
+    ));
+    let initial_context_injection = match initial_context_injection {
+        InitialContextInjection::BeforeLastUserMessage(_) => {
+            let world_state = Arc::new(
+                sess.build_world_state_for_step(refreshed_step_context.as_ref())
+                    .await,
+            );
+            InitialContextInjection::BeforeLastUserMessage(world_state)
+        }
+        InitialContextInjection::DoNotInject => InitialContextInjection::DoNotInject,
+    };
+    (refreshed_step_context, initial_context_injection)
+}
+
+async fn refresh_initial_context_injection_for_compaction(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    step_context: Option<&Arc<StepContext>>,
+    initial_context_injection: InitialContextInjection,
+) -> InitialContextInjection {
+    let captured_step_context;
+    let step_context = match step_context {
+        Some(step_context) => step_context,
+        None => {
+            captured_step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
+            &captured_step_context
+        }
+    };
+    let (_, initial_context_injection) =
+        refresh_compaction_step_context(sess, step_context, initial_context_injection).await;
+    initial_context_injection
+}
+
 pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
     provider.supports_remote_compaction()
 }
 
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
+    let turn_context = Arc::clone(&step_context.turn);
     let prompt = turn_context
         .config
         .compact_prompt
@@ -110,11 +168,14 @@ pub(crate) async fn run_inline_auto_compact_task(
     run_compact_task_inner(
         sess,
         turn_context,
-        input,
-        initial_context_injection,
-        CompactionTrigger::Auto,
-        reason,
-        phase,
+        CompactTaskRequest {
+            step_context: Some(step_context),
+            input,
+            initial_context_injection,
+            trigger: CompactionTrigger::Auto,
+            reason,
+            phase,
+        },
     )
     .await?;
     Ok(())
@@ -136,25 +197,41 @@ pub(crate) async fn run_compact_task(
     run_compact_task_inner(
         sess.clone(),
         turn_context,
-        input,
-        InitialContextInjection::DoNotInject,
-        CompactionTrigger::Manual,
-        CompactionReason::UserRequested,
-        CompactionPhase::StandaloneTurn,
+        CompactTaskRequest {
+            step_context: None,
+            input,
+            initial_context_injection: InitialContextInjection::DoNotInject,
+            trigger: CompactionTrigger::Manual,
+            reason: CompactionReason::UserRequested,
+            phase: CompactionPhase::StandaloneTurn,
+        },
     )
     .await?;
     Ok(())
 }
 
-async fn run_compact_task_inner(
-    sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+struct CompactTaskRequest {
+    step_context: Option<Arc<StepContext>>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
+}
+
+async fn run_compact_task_inner(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    request: CompactTaskRequest,
 ) -> CodexResult<()> {
+    let CompactTaskRequest {
+        step_context,
+        input,
+        initial_context_injection,
+        trigger,
+        reason,
+        phase,
+    } = request;
     let compaction_metadata =
         CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
     let attempt = CompactionAnalyticsAttempt::begin(
@@ -182,6 +259,13 @@ async fn run_compact_task_inner(
             return Err(error);
         }
     }
+    let initial_context_injection = refresh_initial_context_injection_for_compaction(
+        &sess,
+        &turn_context,
+        step_context.as_ref(),
+        initial_context_injection,
+    )
+    .await;
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
@@ -322,7 +406,7 @@ async fn run_compact_task_inner_impl(
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.raw_items();
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
-    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+    let summary_text = format_compaction_summary(&summary_suffix);
     let user_messages = collect_user_messages(history_items);
 
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
@@ -522,7 +606,14 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
 }
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
-    message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
+    starts_with_summary_prefix(message, SUMMARY_PREFIX)
+        || starts_with_summary_prefix(message, LEGACY_SUMMARY_PREFIX)
+}
+
+fn starts_with_summary_prefix(message: &str, prefix: &str) -> bool {
+    message
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('\n'))
 }
 
 /// Inserts canonical initial context into compacted replacement history at the

@@ -4713,6 +4713,26 @@
           "type": "object"
         },
         {
+          "properties": {
+            "method": {
+              "enum": [
+                "item/commandExecution/backgroundTrigger"
+              ],
+              "title": "Item/commandExecution/backgroundTriggerNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/CommandExecutionBackgroundTriggerNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Item/commandExecution/backgroundTriggerNotification",
+          "type": "object"
+        },
+        {
           "description": "Deprecated legacy apply_patch output stream notification.",
           "properties": {
             "method": {
@@ -7724,6 +7744,56 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Empty success response for `command/exec/write`.",
         "title": "CommandExecWriteResponse",
+        "type": "object"
+      },
+      "CommandExecutionBackgroundTriggerNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "declaredTriggers": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "itemId": {
+            "type": "string"
+          },
+          "outputTail": {
+            "default": "",
+            "type": "string"
+          },
+          "processId": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "trigger": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "itemId",
+          "processId",
+          "reason",
+          "threadId",
+          "trigger",
+          "turnId"
+        ],
+        "title": "CommandExecutionBackgroundTriggerNotification",
         "type": "object"
       },
       "CommandExecutionOutputDeltaNotification": {
@@ -17820,6 +17890,21 @@
                   "string",
                   "null"
                 ]
+              },
+              "backgroundDescription": {
+                "description": "Short purpose for long-running background command executions.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "backgroundTriggers": {
+                "default": [],
+                "description": "Raw trigger policy strings declared for long-running background command executions.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
               },
               "command": {
                 "description": "The command to be executed.",

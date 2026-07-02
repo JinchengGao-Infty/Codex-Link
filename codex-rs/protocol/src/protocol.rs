@@ -1368,6 +1368,9 @@ pub enum EventMsg {
     /// Incremental chunk of output from a running command.
     ExecCommandOutputDelta(ExecCommandOutputDeltaEvent),
 
+    /// A local background trigger fired while a command is still running.
+    ExecBackgroundTrigger(Box<ExecBackgroundTriggerEvent>),
+
     /// Terminal interaction for an in-progress command (stdin sent and stdout observed).
     TerminalInteraction(TerminalInteractionEvent),
 
@@ -3494,6 +3497,13 @@ pub struct ExecCommandBeginEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub interaction_input: Option<String>,
+    /// Short background job purpose supplied by the model for long-running unified exec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub background_description: Option<String>,
+    /// Raw declared background trigger strings for long-running unified exec.
+    #[serde(default)]
+    pub background_triggers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -3569,6 +3579,36 @@ pub struct ExecCommandOutputDeltaEvent {
     #[schemars(with = "String")]
     #[ts(type = "string")]
     pub chunk: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct ExecBackgroundTriggerEvent {
+    /// Identifier for the ExecCommandBegin that started this background command.
+    pub call_id: String,
+    /// Identifier for the underlying PTY process.
+    pub process_id: String,
+    /// Turn ID that this command belongs to.
+    pub turn_id: String,
+    #[serde(default)]
+    pub triggered_at_ms: i64,
+    /// The command that is still running.
+    pub command: Vec<String>,
+    /// The command's working directory.
+    pub cwd: PathUri,
+    /// Short background job purpose supplied by the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
+    /// Raw declared background trigger strings.
+    #[serde(default)]
+    pub declared_triggers: Vec<String>,
+    /// The concrete trigger that fired.
+    pub trigger: String,
+    /// Human-readable reason for the trigger.
+    pub reason: String,
+    /// Recent process output retained when the trigger fired.
+    #[serde(default)]
+    pub output_tail: String,
 }
 
 #[serde_as]

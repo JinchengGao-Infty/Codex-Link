@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::SkillInjections;
+use crate::agents_md::AgentsMdFocusPath;
 use crate::build_skill_injections;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
@@ -56,6 +57,7 @@ use crate::stream_events_utils::record_completed_response_item_with_finalized_fa
 use crate::tasks::emit_compact_metric;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::parallel::HandledToolCall;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolRouterParams;
@@ -91,7 +93,6 @@ use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
@@ -125,6 +126,8 @@ use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 
+const AGENTS_MD_FOCUS_PATH_MAX_PER_TURN: usize = 16;
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -139,6 +142,104 @@ use tracing::warn;
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
+fn collect_agents_md_focus_paths(
+    input: &[TurnInput],
+    environments: &crate::environment_selection::TurnEnvironmentSnapshot,
+) -> Vec<AgentsMdFocusPath> {
+    let mut candidates = Vec::new();
+    let mut seen_candidates = HashSet::new();
+    for turn_input in input {
+        let TurnInput::UserInput { content, .. } = turn_input else {
+            continue;
+        };
+        for user_input in content {
+            collect_agents_md_focus_path_candidates(
+                user_input,
+                &mut candidates,
+                &mut seen_candidates,
+            );
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut focus_paths = Vec::new();
+    let mut seen_focus_paths = HashSet::new();
+    'environments: for turn_environment in &environments.turn_environments {
+        for candidate in &candidates {
+            let Ok(path) = turn_environment.cwd().join(candidate) else {
+                continue;
+            };
+            let focus_path = AgentsMdFocusPath {
+                environment_id: turn_environment.environment_id.clone(),
+                path,
+            };
+            if seen_focus_paths.insert(focus_path.clone()) {
+                focus_paths.push(focus_path);
+                if focus_paths.len() >= AGENTS_MD_FOCUS_PATH_MAX_PER_TURN {
+                    break 'environments;
+                }
+            }
+        }
+    }
+    focus_paths
+}
+
+fn collect_agents_md_focus_path_candidates(
+    user_input: &UserInput,
+    candidates: &mut Vec<String>,
+    seen_candidates: &mut HashSet<String>,
+) {
+    match user_input {
+        UserInput::Text { text, .. } => {
+            for raw_candidate in text.split(char::is_whitespace) {
+                let Some(candidate) = normalize_agents_md_focus_path_candidate(raw_candidate)
+                else {
+                    continue;
+                };
+                if seen_candidates.insert(candidate.clone()) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        UserInput::Mention { path, .. } => {
+            let Some(candidate) = normalize_agents_md_focus_path_candidate(path) else {
+                return;
+            };
+            if seen_candidates.insert(candidate.clone()) {
+                candidates.push(candidate);
+            }
+        }
+        UserInput::Image { .. } | UserInput::LocalImage { .. } | UserInput::Skill { .. } => {}
+        _ => {}
+    }
+}
+
+fn normalize_agents_md_focus_path_candidate(raw_candidate: &str) -> Option<String> {
+    let candidate = raw_candidate
+        .trim_matches(is_agents_md_focus_path_boundary)
+        .trim_start_matches('@')
+        .trim_end_matches(['.', ',', ';', ':'])
+        .trim_matches(is_agents_md_focus_path_boundary);
+    if candidate.is_empty()
+        || candidate.contains("://")
+        || candidate.len() > 512
+        || candidate.contains('\0')
+        || (!candidate.contains('/') && !candidate.contains('\\'))
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn is_agents_md_focus_path_boundary(character: char) -> bool {
+    matches!(
+        character,
+        '`' | '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
+    )
+}
+
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -162,6 +263,18 @@ pub(crate) async fn run_turn(
             .await;
         error!("Failed to run pre-sampling compact");
         return Ok(None);
+    }
+
+    let agents_md_focus_paths = collect_agents_md_focus_paths(&input, &turn_context.environments);
+    if !agents_md_focus_paths.is_empty() {
+        sess.services
+            .agents_md_manager
+            .refresh_for_focus_paths(
+                &turn_context.config,
+                &turn_context.environments,
+                agents_md_focus_paths,
+            )
+            .await;
     }
 
     // run_turn owns the step used to seed context and make the first sampling request.
@@ -281,7 +394,7 @@ pub(crate) async fn run_turn(
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
-            run_sampling_request(
+            Box::pin(run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
                 Arc::clone(&turn_extension_data),
@@ -290,7 +403,7 @@ pub(crate) async fn run_turn(
                 &responses_metadata,
                 sampling_request_input,
                 cancellation_token.child_token(),
-            )
+            ))
             .await
         }
         .await;
@@ -979,7 +1092,7 @@ async fn run_auto_compact(
         );
         run_inline_auto_compact_task(
             Arc::clone(sess),
-            Arc::clone(turn_context),
+            step_context,
             initial_context_injection,
             reason,
             phase,
@@ -1114,7 +1227,7 @@ async fn run_sampling_request(
             turn_context.as_ref(),
             base_instructions.clone(),
         );
-        let err = match try_run_sampling_request(
+        let err = match Box::pin(try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -1124,7 +1237,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             cancellation_token.child_token(),
-        )
+        ))
         .await
         {
             Ok(output) => {
@@ -1524,6 +1637,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::WebSearchEnd(_)
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::ExecCommandOutputDelta(_)
+        | EventMsg::ExecBackgroundTrigger(_)
         | EventMsg::TerminalInteraction(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::PatchApplyBegin(_)
@@ -1851,14 +1965,16 @@ async fn handle_assistant_item_done_in_plan_mode(
 
 #[instrument(level = "trace", skip_all)]
 async fn drain_in_flight(
-    in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
+    in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<HandledToolCall>>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-) -> CodexResult<()> {
+) -> CodexResult<bool> {
+    let mut needs_follow_up = false;
     while let Some(res) = in_flight.next().await {
         match res {
-            Ok(response_input) => {
-                let response_item = response_input.into();
+            Ok(handled) => {
+                needs_follow_up |= handled.needs_follow_up;
+                let response_item = handled.response.into();
                 sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
                     .await;
                 mark_thread_memory_mode_polluted_if_external_context(
@@ -1873,7 +1989,7 @@ async fn drain_in_flight(
             }
         }
     }
-    Ok(())
+    Ok(needs_follow_up)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1909,23 +2025,27 @@ async fn try_run_sampling_request(
         turn_context.provider.info().name.as_str(),
     );
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
-    let mut stream = client_session
-        .stream(
-            prompt,
-            &turn_context.model_info,
-            &turn_context.session_telemetry,
-            turn_context.reasoning_effort.clone(),
-            turn_context.reasoning_summary,
-            turn_context.config.service_tier.clone(),
-            responses_metadata,
-            &inference_trace,
-        )
-        .instrument(trace_span!("stream_request"))
-        .or_cancel(&cancellation_token)
-        .await??;
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+    let mut stream = Box::pin(
+        client_session
+            .stream(
+                prompt,
+                &turn_context.model_info,
+                &turn_context.session_telemetry,
+                turn_context.reasoning_effort.clone(),
+                turn_context.reasoning_summary,
+                turn_context.config.service_tier.clone(),
+                responses_metadata,
+                &inference_trace,
+            )
+            .instrument(trace_span!("stream_request"))
+            .or_cancel(&cancellation_token),
+    )
+    .await??;
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<HandledToolCall>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
+    let mut tool_call_count = 0usize;
+    let mut response_completed_requested_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
@@ -2065,6 +2185,7 @@ async fn try_run_sampling_request(
                         Err(err) => break Err(err),
                     };
                 if let Some(tool_future) = output_result.tool_future {
+                    tool_call_count = tool_call_count.saturating_add(1);
                     in_flight.push_back(tool_future);
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
@@ -2230,7 +2351,7 @@ async fn try_run_sampling_request(
                     break Err(err);
                 }
                 if let Some(false) = end_turn {
-                    needs_follow_up = true;
+                    response_completed_requested_follow_up = true;
                 }
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
@@ -2361,8 +2482,19 @@ async fn try_run_sampling_request(
     } else {
         Some(turn_context.turn_timing_state.begin_tool_blocking())
     };
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    let in_flight_needs_follow_up =
+        drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
     drop(tool_blocking_timing_guard);
+
+    let mut outcome = outcome;
+    if let Ok(output) = &mut outcome {
+        output.needs_follow_up |= in_flight_needs_follow_up;
+        if response_completed_requested_follow_up
+            && (tool_call_count == 0 || in_flight_needs_follow_up)
+        {
+            output.needs_follow_up = true;
+        }
+    }
 
     if should_emit_token_count {
         // A tool call such as request_user_input can intentionally pause the turn. Emit token

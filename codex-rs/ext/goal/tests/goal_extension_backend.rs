@@ -1300,6 +1300,7 @@ impl GoalExtensionHarness {
                     tool_name: &tool_name,
                     source: ToolCallSource::Direct,
                     outcome: ToolCallOutcome::Completed { success: true },
+                    output_preview: None,
                 })
                 .await;
         }

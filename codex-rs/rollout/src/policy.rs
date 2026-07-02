@@ -137,6 +137,7 @@ pub fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::TerminalInteraction(_)
         | EventMsg::ExecCommandOutputDelta(_)
+        | EventMsg::ExecBackgroundTrigger(_)
         | EventMsg::ExecApprovalRequest(_)
         | EventMsg::RequestPermissions(_)
         | EventMsg::RequestUserInput(_)

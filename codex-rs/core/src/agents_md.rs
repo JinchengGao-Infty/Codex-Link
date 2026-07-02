@@ -3,7 +3,8 @@
 //! Project-level documentation is primarily stored in files named `AGENTS.md`.
 //! Additional fallback filenames can be configured via `project_doc_fallback_filenames`.
 //! We include the concatenation of all files found along the path from the
-//! project root to the current working directory as follows:
+//! project root to the current working directory, plus any task-focused paths
+//! mentioned by the user, as follows:
 //!
 //! 1.  Determine the project root by walking upwards from the current working
 //!     directory until a configured `project_root_markers` entry is found.
@@ -11,9 +12,10 @@
 //!     (`.git`). If no marker is found, only the current working directory is
 //!     considered. An empty marker list disables parent traversal.
 //! 2.  Collect every `AGENTS.md` found from the project root down to the
-//!     current working directory (inclusive) and concatenate their contents in
-//!     that order.
-//! 3.  We do **not** walk past the project root.
+//!     current working directory (inclusive).
+//! 3.  For mentioned files or directories under the same project root, collect
+//!     their root-to-path `AGENTS.md` chain as well.
+//! 4.  We do **not** walk past the project root.
 
 use crate::config::Config;
 use crate::context::UserInstructions as ContextUserInstructions;
@@ -29,6 +31,7 @@ use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use std::collections::HashSet;
 use std::io;
 use toml::Value as TomlValue;
 use tracing::error;
@@ -41,22 +44,51 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 /// When both user and project AGENTS.md docs are present, they will be
 /// concatenated with the following separator.
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
+const AGENTS_MD_IMPORT_MAX_DEPTH: usize = 4;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct AgentsMdFocusPath {
+    pub(crate) environment_id: String,
+    pub(crate) path: PathUri,
+}
 
 /// Loads project AGENTS.md content and combines it with host-provided user
 /// instructions.
+#[cfg(test)]
 pub(crate) async fn load_project_instructions(
     config: &Config,
     user_instructions: Option<UserInstructions>,
     environments: &TurnEnvironmentSnapshot,
 ) -> Option<LoadedAgentsMd> {
+    load_project_instructions_with_focus_paths(
+        config,
+        user_instructions,
+        environments,
+        /*focus_paths*/ &[],
+    )
+    .await
+}
+
+pub(crate) async fn load_project_instructions_with_focus_paths(
+    config: &Config,
+    user_instructions: Option<UserInstructions>,
+    environments: &TurnEnvironmentSnapshot,
+    focus_paths: &[AgentsMdFocusPath],
+) -> Option<LoadedAgentsMd> {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
     for turn_environment in &environments.turn_environments {
         let filesystem = turn_environment.environment.get_filesystem();
+        let environment_focus_paths = focus_paths
+            .iter()
+            .filter(|focus_path| focus_path.environment_id == turn_environment.environment_id)
+            .map(|focus_path| focus_path.path.clone())
+            .collect::<Vec<_>>();
         match read_agents_md(
             config,
             filesystem.as_ref(),
             &turn_environment.environment_id,
             turn_environment.cwd(),
+            &environment_focus_paths,
         )
         .await
         {
@@ -85,6 +117,7 @@ async fn read_agents_md(
     fs: &dyn ExecutorFileSystem,
     environment_id: &str,
     cwd: &PathUri,
+    focus_paths: &[PathUri],
 ) -> io::Result<Option<LoadedAgentsMd>> {
     let max_total = config.project_doc_max_bytes;
 
@@ -92,48 +125,51 @@ async fn read_agents_md(
         return Ok(None);
     }
 
-    let paths = agents_md_paths(config, cwd, fs).await?;
-    if paths.is_empty() {
-        return Ok(None);
-    }
+    let discovery = discover_agents_md(config, cwd, fs).await?;
 
     let mut remaining: u64 = max_total as u64;
     let mut loaded = LoadedAgentsMd::default();
 
-    for p in paths {
+    let read_context = AgentsMdReadContext {
+        fs,
+        environment_id,
+        cwd,
+        import_root: &discovery.project_root,
+    };
+    let mut visited = HashSet::new();
+    for path in discovery.paths {
+        read_agents_md_path_with_imports(
+            &read_context,
+            path,
+            &mut remaining,
+            &mut loaded,
+            &mut visited,
+        )
+        .await?;
+    }
+    for focus_path in focus_paths {
         if remaining == 0 {
             break;
         }
-
-        let mut data = match fs.read_file(&p, /*sandbox*/ None).await {
-            Ok(data) => data,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
+        let Some(focus_dir) = agents_md_focus_dir(fs, focus_path).await? else {
+            continue;
         };
-        let size = data.len() as u64;
-        if size > remaining {
-            data.truncate(remaining as usize);
+        if !focus_dir.starts_with(&discovery.project_root) {
+            continue;
         }
-
-        if size > remaining {
-            tracing::warn!(
-                path = %p,
-                remaining_bytes = remaining,
-                "project doc exceeds remaining budget; truncating"
-            );
+        let focus_discovery = discover_agents_md(config, &focus_dir, fs).await?;
+        if focus_discovery.project_root != discovery.project_root {
+            continue;
         }
-
-        let text = String::from_utf8_lossy(&data).to_string();
-        if !text.trim().is_empty() {
-            loaded.entries.push(InstructionEntry {
-                contents: text,
-                provenance: InstructionProvenance::Project {
-                    source_path: p,
-                    environment_id: environment_id.to_string(),
-                    cwd: cwd.clone(),
-                },
-            });
-            remaining = remaining.saturating_sub(data.len() as u64);
+        for path in focus_discovery.paths {
+            read_agents_md_path_with_imports(
+                &read_context,
+                path,
+                &mut remaining,
+                &mut loaded,
+                &mut visited,
+            )
+            .await?;
         }
     }
 
@@ -144,15 +180,232 @@ async fn read_agents_md(
     }
 }
 
+struct PendingAgentsMdPath {
+    path: PathUri,
+    import_depth: usize,
+}
+
+struct AgentsMdReadContext<'a> {
+    fs: &'a dyn ExecutorFileSystem,
+    environment_id: &'a str,
+    cwd: &'a PathUri,
+    import_root: &'a PathUri,
+}
+
+async fn read_agents_md_path_with_imports(
+    context: &AgentsMdReadContext<'_>,
+    path: PathUri,
+    remaining: &mut u64,
+    loaded: &mut LoadedAgentsMd,
+    visited: &mut HashSet<PathUri>,
+) -> io::Result<()> {
+    let mut pending = vec![PendingAgentsMdPath {
+        path,
+        import_depth: 0,
+    }];
+
+    while let Some(PendingAgentsMdPath { path, import_depth }) = pending.pop() {
+        if *remaining == 0 {
+            break;
+        }
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let Some(text) = read_agents_md_file(context.fs, &path, remaining).await? else {
+            continue;
+        };
+        let imports = if import_depth < AGENTS_MD_IMPORT_MAX_DEPTH {
+            extract_agents_md_imports(&text)
+        } else {
+            Vec::new()
+        };
+        loaded.entries.push(InstructionEntry {
+            contents: text,
+            provenance: InstructionProvenance::Project {
+                source_path: path.clone(),
+                environment_id: context.environment_id.to_string(),
+                cwd: context.cwd.clone(),
+            },
+        });
+        for imported in imports.into_iter().rev() {
+            let Some(import_path) =
+                resolve_agents_md_import_path(&path, context.import_root, &imported)
+            else {
+                continue;
+            };
+            pending.push(PendingAgentsMdPath {
+                path: import_path,
+                import_depth: import_depth + 1,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_agents_md_file(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    remaining: &mut u64,
+) -> io::Result<Option<String>> {
+    match fs.get_metadata(path, /*sandbox*/ None).await {
+        Ok(metadata) if metadata.is_file => {}
+        Ok(_) => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    }
+
+    let mut data = match fs.read_file(path, /*sandbox*/ None).await {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let size = data.len() as u64;
+    if size > *remaining {
+        data.truncate(*remaining as usize);
+    }
+
+    if size > *remaining {
+        tracing::warn!(
+            path = %path,
+            remaining_bytes = remaining,
+            "project doc exceeds remaining budget; truncating"
+        );
+    }
+
+    *remaining = remaining.saturating_sub(data.len() as u64);
+    let text = String::from_utf8_lossy(&data).to_string();
+    if text.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text))
+    }
+}
+
+fn resolve_agents_md_import_path(
+    source_path: &PathUri,
+    import_root: &PathUri,
+    import_path: &str,
+) -> Option<PathUri> {
+    let base_dir = source_path.parent().unwrap_or_else(|| import_root.clone());
+    let resolved = match base_dir.join(import_path) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            tracing::warn!(
+                source_path = %source_path,
+                import_path,
+                "invalid AGENTS.md import path: {err}"
+            );
+            return None;
+        }
+    };
+    if !resolved.starts_with(import_root) {
+        tracing::warn!(
+            source_path = %source_path,
+            import_path,
+            resolved_path = %resolved,
+            import_root = %import_root,
+            "ignoring AGENTS.md import outside project doc root"
+        );
+        return None;
+    }
+    Some(resolved)
+}
+
+fn extract_agents_md_imports(contents: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    let mut in_fenced_block = false;
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fenced_block = !in_fenced_block;
+            continue;
+        }
+        if in_fenced_block {
+            continue;
+        }
+        extract_agents_md_imports_from_line(line, &mut imports);
+    }
+    imports
+}
+
+fn extract_agents_md_imports_from_line(line: &str, imports: &mut Vec<String>) {
+    let mut in_inline_code = false;
+    let mut chars = line.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        if character == '`' {
+            in_inline_code = !in_inline_code;
+            continue;
+        }
+        if character != '@' || in_inline_code {
+            continue;
+        }
+        let previous = line[..index].chars().next_back();
+        if !is_agents_md_import_prefix(previous) {
+            continue;
+        }
+        let start = index + character.len_utf8();
+        let mut end = start;
+        while let Some((next_index, next_character)) = chars.peek().copied() {
+            if !is_agents_md_import_path_char(next_character) {
+                break;
+            }
+            end = next_index + next_character.len_utf8();
+            chars.next();
+        }
+        if let Some(import) = normalize_agents_md_import_candidate(&line[start..end]) {
+            imports.push(import);
+        }
+    }
+}
+
+fn is_agents_md_import_prefix(previous: Option<char>) -> bool {
+    previous.is_none_or(|character| {
+        character.is_whitespace() || matches!(character, '(' | '[' | '<' | '"' | '\'')
+    })
+}
+
+fn is_agents_md_import_path_char(character: char) -> bool {
+    !character.is_whitespace()
+        && !matches!(
+            character,
+            '`' | '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '#'
+        )
+}
+
+fn normalize_agents_md_import_candidate(candidate: &str) -> Option<String> {
+    let candidate = candidate.trim_end_matches(['.', ',', ';', ':']);
+    if candidate.is_empty()
+        || candidate.contains(':')
+        || (!candidate.contains('/') && !candidate.contains('\\') && !candidate.contains('.'))
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+struct AgentsMdDiscovery {
+    project_root: PathUri,
+    paths: Vec<PathUri>,
+}
+
 /// Discovers AGENTS.md files from the project root to the current working
 /// directory, inclusive. Symlinks are allowed.
+#[cfg(test)]
 async fn agents_md_paths(
     config: &Config,
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
 ) -> io::Result<Vec<PathUri>> {
-    let dir = cwd.clone();
+    Ok(discover_agents_md(config, cwd, fs).await?.paths)
+}
 
+async fn discover_agents_md(
+    config: &Config,
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+) -> io::Result<AgentsMdDiscovery> {
+    let dir = cwd.clone();
     let mut merged = TomlValue::Table(toml::map::Map::new());
     for layer in config.config_layer_stack.get_layers(
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
@@ -179,7 +432,7 @@ async fn agents_md_paths(
         /*sandbox*/ None,
     )
     .await?;
-    let search_dirs = if let Some(root) = project_root {
+    let (project_root, search_dirs) = if let Some(root) = project_root {
         let mut dirs = Vec::new();
         let mut cursor = dir.clone();
         loop {
@@ -193,9 +446,9 @@ async fn agents_md_paths(
             cursor = parent;
         }
         dirs.reverse();
-        dirs
+        (root, dirs)
     } else {
-        vec![dir]
+        (dir.clone(), vec![dir])
     };
 
     let mut found = Vec::new();
@@ -216,7 +469,33 @@ async fn agents_md_paths(
             }
         }
     }
-    Ok(found)
+    Ok(AgentsMdDiscovery {
+        project_root,
+        paths: found,
+    })
+}
+
+async fn agents_md_focus_dir(
+    fs: &dyn ExecutorFileSystem,
+    focus_path: &PathUri,
+) -> io::Result<Option<PathUri>> {
+    match fs.get_metadata(focus_path, /*sandbox*/ None).await {
+        Ok(metadata) if metadata.is_directory => Ok(Some(focus_path.clone())),
+        Ok(metadata) if metadata.is_file => Ok(focus_path.parent()),
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let Some(parent) = focus_path.parent() else {
+                return Ok(None);
+            };
+            match fs.get_metadata(&parent, /*sandbox*/ None).await {
+                Ok(metadata) if metadata.is_directory => Ok(Some(parent)),
+                Ok(_) => Ok(None),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn candidate_filenames(config: &Config) -> Vec<&str> {

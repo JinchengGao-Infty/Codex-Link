@@ -717,6 +717,21 @@
                 "null"
               ]
             },
+            "backgroundDescription": {
+              "description": "Short purpose for long-running background command executions.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "backgroundTriggers": {
+              "default": [],
+              "description": "Raw trigger policy strings declared for long-running background command executions.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "command": {
               "description": "The command to be executed.",
               "type": "string"

@@ -1645,6 +1645,7 @@ server_notification_definitions! {
     ProcessExited => "process/exited" (v2::ProcessExitedNotification),
     CommandExecutionOutputDelta => "item/commandExecution/outputDelta" (v2::CommandExecutionOutputDeltaNotification),
     TerminalInteraction => "item/commandExecution/terminalInteraction" (v2::TerminalInteractionNotification),
+    CommandExecutionBackgroundTrigger => "item/commandExecution/backgroundTrigger" (v2::CommandExecutionBackgroundTriggerNotification),
     /// Deprecated legacy apply_patch output stream notification.
     FileChangeOutputDelta => "item/fileChange/outputDelta" (v2::FileChangeOutputDeltaNotification),
     FileChangePatchUpdated => "item/fileChange/patchUpdated" (v2::FileChangePatchUpdatedNotification),

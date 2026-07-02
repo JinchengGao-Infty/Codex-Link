@@ -1,7 +1,7 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_core::compact::SUMMARIZATION_PROMPT;
-use codex_core::compact::SUMMARY_PREFIX;
+use codex_core::compact::format_compaction_summary;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_login::CodexAuth;
@@ -134,7 +134,7 @@ fn auto_summary(summary: &str) -> String {
 }
 
 fn summary_with_prefix(summary: &str) -> String {
-    format!("{SUMMARY_PREFIX}\n{summary}")
+    format_compaction_summary(summary)
 }
 
 fn set_test_compact_prompt(config: &mut Config) {

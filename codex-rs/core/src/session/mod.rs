@@ -1753,6 +1753,7 @@ impl Session {
                 .await
                 .replace(error.message.clone());
         }
+        Box::pin(self.notify_turn_event_contributors(turn_context, &legacy_source)).await;
         self.services
             .rollout_thread_trace
             .record_codex_turn_event(&turn_context.sub_id, &legacy_source);
@@ -1778,6 +1779,20 @@ impl Session {
                 msg: legacy,
             };
             self.send_event_raw(legacy_event).await;
+        }
+    }
+
+    async fn notify_turn_event_contributors(&self, turn_context: &TurnContext, event: &EventMsg) {
+        for contributor in self.services.extensions.turn_event_contributors() {
+            contributor
+                .on_turn_event(codex_extension_api::TurnEventInput {
+                    session_store: &self.services.session_extension_data,
+                    thread_store: &self.services.thread_extension_data,
+                    turn_store: turn_context.extension_data.as_ref(),
+                    turn_id: &turn_context.sub_id,
+                    event,
+                })
+                .await;
         }
     }
 

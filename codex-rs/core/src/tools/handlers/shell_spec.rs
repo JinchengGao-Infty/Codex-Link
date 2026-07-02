@@ -45,7 +45,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
-                "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.".to_string(),
+                "Wait before yielding output. Defaults to 600000 ms for foreground commands, or 250 ms when background=true; effective range is 250-600000 ms.".to_string(),
             )),
         ),
         (
@@ -53,6 +53,29 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             JsonSchema::number(Some(
                 "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy.".to_string(),
             )),
+        ),
+        (
+            "background".to_string(),
+            JsonSchema::boolean(Some(
+                "True declares this as a long-running background job and keeps the initial wait short. Use this proactively for commands likely to run over 10 minutes, persistent servers/watchers, training jobs, benchmarks, or large build/test suites so the user can keep chatting while Codex watches locally. The command still runs through Codex native unified_exec approval, sandbox, and hooks; Codex returns after the initial yield with a session_id while a local watcher streams output and emits trigger/completion events.".to_string(),
+            )),
+        ),
+        (
+            "background_description".to_string(),
+            JsonSchema::string(Some(
+                "Required when background is true. Short purpose and success condition for the background job, preserved in compact-survival context.".to_string(),
+            )),
+        ),
+        (
+            "background_triggers".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(Some(
+                    "Executable background trigger. Supported forms: on_exit, failure_exit, regex:<pattern>, no_output_for:<duration>, metric_threshold:<metric><op><number>, plateau:<metric> patience=<n> min_delta=<x> mode=min|max.".to_string(),
+                )),
+                Some(
+                    "Optional trigger policy for this background job. Native unified_exec evaluates supported triggers locally and wakes the model at most once per fired trigger.".to_string(),
+                ),
+            ),
         ),
     ]);
     if include_shell_parameter {
@@ -89,12 +112,12 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         name: "exec_command".to_string(),
         description: if cfg!(windows) {
             format!(
-                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
+                "{}\n\n{}",
+                exec_command_description(),
                 windows_shell_guidance()
             )
         } else {
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
-                .to_string()
+            exec_command_description()
         },
         strict: false,
         defer_loading: None,
@@ -105,6 +128,11 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         ),
         output_schema: Some(unified_exec_output_schema()),
     })
+}
+
+fn exec_command_description() -> String {
+    "Runs a command in a PTY, returning output or a session ID for ongoing interaction. Estimate expected runtime before choosing foreground. Use foreground for quick commands expected to finish soon. For commands likely to run over 10 minutes, persistent servers/watchers, training jobs, benchmarks, or large build/test suites, set `background=true`, provide `background_description`, and declare triggers such as `on_exit`, `failure_exit`, `regex:<pattern>`, `no_output_for:<duration>`, `metric_threshold:<metric><op><number>`, or `plateau:<metric> patience=<n> min_delta=<x> mode=min|max`. Foreground commands still auto-background after 10 minutes as a fallback. Do not repeatedly empty-poll with write_stdin; rely on background triggers and use status/tail checks only when needed."
+        .to_string()
 }
 
 pub fn create_write_stdin_tool() -> ToolSpec {
@@ -118,13 +146,13 @@ pub fn create_write_stdin_tool() -> ToolSpec {
         (
             "chars".to_string(),
             JsonSchema::string(Some(
-                "Bytes to write to stdin. Defaults to empty, which polls without writing.".to_string(),
+                "Bytes to write to stdin. Omit or leave empty for a one-shot local wait/status check without writing.".to_string(),
             )),
         ),
         (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.".to_string(),
+                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty local waits use 5000-300000 ms. Use empty waits as single tail/status checks; rely on background triggers for long-running supervision.".to_string(),
             )),
         ),
         (
@@ -137,9 +165,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "write_stdin".to_string(),
-        description:
-            "Writes characters to an existing unified exec session and returns recent output."
-                .to_string(),
+        description: "Writes characters to an existing unified exec session. With empty chars, performs one local wait/status check for output or completion; do not use it as a repeated background polling loop.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(

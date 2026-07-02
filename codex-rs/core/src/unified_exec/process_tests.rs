@@ -102,7 +102,7 @@ async fn remote_process(
         }),
     };
 
-    UnifiedExecProcess::from_exec_server_started(started)
+    UnifiedExecProcess::from_exec_server_started(started, None)
         .await
         .expect("remote process should start")
 }

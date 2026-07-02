@@ -8274,6 +8274,150 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
 }
 
 #[tokio::test]
+async fn build_initial_context_includes_link_context_capsule() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    codex_link_context_extension::install(&mut builder);
+    session.services.extensions = Arc::new(builder.build());
+    session
+        .services
+        .thread_extension_data
+        .insert(codex_link_context_extension::LinkContextState {
+            active_goal: Some("preserve compact-safe task state".to_string()),
+            success_criteria: vec!["capsule is injected from extension state".to_string()],
+            next_action: Some("continue from the recorded next action".to_string()),
+            ..codex_link_context_extension::LinkContextState::default()
+        });
+    let turn_context = Arc::new(turn_context);
+
+    let initial_context = build_initial_context(&session, &turn_context).await;
+    let user_texts = user_input_texts(&initial_context);
+
+    assert!(
+        user_texts.iter().any(|text| {
+            text.contains("<codex_link_context_capsule>")
+                && text.contains("preserve compact-safe task state")
+                && text.contains("continue from the recorded next action")
+        }),
+        "expected Link context capsule in contextual user message, got {user_texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_initial_context_merges_goal_state_into_link_context_capsule() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let goal_state_dir = tempfile::tempdir().expect("create goal state dir");
+    let goal_state =
+        codex_state::StateRuntime::init(goal_state_dir.path().to_path_buf(), "test".to_string())
+            .await
+            .expect("goal state should initialize");
+    goal_state
+        .thread_goals()
+        .replace_thread_goal(
+            session.thread_id,
+            "finish the compact-safe GoalCard bridge",
+            codex_state::ThreadGoalStatus::Active,
+            Some(12_000),
+        )
+        .await
+        .expect("goal should be created");
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    codex_link_context_extension::install_with_goal_state(&mut builder, goal_state);
+    session.services.extensions = Arc::new(builder.build());
+    let turn_context = Arc::new(turn_context);
+
+    let initial_context = build_initial_context(&session, &turn_context).await;
+    let user_texts = user_input_texts(&initial_context);
+
+    assert!(
+        user_texts.iter().any(|text| {
+            text.contains("<codex_link_context_capsule>")
+                && text.contains("finish the compact-safe GoalCard bridge")
+                && text.contains("Goal status: active")
+                && text.contains("Goal usage: 0 / 12000 tokens")
+        }),
+        "expected goal-backed Link capsule in contextual user message, got {user_texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_initial_context_omits_completed_goal_from_link_context_capsule() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let goal_state_dir = tempfile::tempdir().expect("create goal state dir");
+    let goal_state =
+        codex_state::StateRuntime::init(goal_state_dir.path().to_path_buf(), "test".to_string())
+            .await
+            .expect("goal state should initialize");
+    goal_state
+        .thread_goals()
+        .replace_thread_goal(
+            session.thread_id,
+            "already finished goal",
+            codex_state::ThreadGoalStatus::Complete,
+            None,
+        )
+        .await
+        .expect("goal should be created");
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    codex_link_context_extension::install_with_goal_state(&mut builder, goal_state);
+    session.services.extensions = Arc::new(builder.build());
+    let turn_context = Arc::new(turn_context);
+
+    let initial_context = build_initial_context(&session, &turn_context).await;
+    let user_texts = user_input_texts(&initial_context);
+
+    assert!(
+        !user_texts.iter().any(|text| {
+            text.contains("<codex_link_context_capsule>") || text.contains("already finished goal")
+        }),
+        "did not expect completed goal in Link capsule, got {user_texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn record_context_updates_reinjects_link_context_capsule_on_steady_state_turns() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    codex_link_context_extension::install(&mut builder);
+    session.services.extensions = Arc::new(builder.build());
+    session
+        .services
+        .thread_extension_data
+        .insert(codex_link_context_extension::LinkContextState {
+            active_goal: Some("survive compact rewrite".to_string()),
+            verified_evidence: vec!["thread store still owns the capsule state".to_string()],
+            ..codex_link_context_extension::LinkContextState::default()
+        });
+    let mut previous_context_item = turn_context.to_turn_context_item();
+    previous_context_item.turn_id = Some("previous-turn-id".to_string());
+    let turn_context = Arc::new(turn_context);
+    let world_state = build_world_state_from_turn_context(&session, &turn_context).await;
+    {
+        let mut state = session.state.lock().await;
+        state.set_reference_context_item(Some(previous_context_item));
+        state
+            .history
+            .set_world_state_baseline(world_state.snapshot());
+    }
+
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    session
+        .record_context_updates_and_set_reference_context_item(&step_context)
+        .await;
+
+    let history = session.clone_history().await;
+    let user_texts = user_input_texts(history.raw_items());
+    assert!(
+        user_texts.iter().any(|text| {
+            text.contains("<codex_link_context_capsule>")
+                && text.contains("survive compact rewrite")
+                && text.contains("thread store still owns the capsule state")
+        }),
+        "expected steady-state Link capsule reinjection, got {user_texts:?}"
+    );
+}
+
+#[tokio::test]
 async fn build_initial_context_omits_prompt_fragments_without_extension_state() {
     let (mut session, turn_context) = make_session_and_context().await;
     session.services.extensions = prompt_extension_test_registry();
@@ -8890,7 +9034,7 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
-            text: format!("{}\nsummary", crate::compact::SUMMARY_PREFIX),
+            text: crate::compact::format_compaction_summary("summary"),
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
@@ -8921,6 +9065,147 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
     let initial_context = build_initial_context(&session, &turn_context).await;
     expected_history.extend(initial_context);
     assert_eq!(history.raw_items().to_vec(), expected_history);
+}
+
+#[tokio::test]
+async fn refresh_compaction_step_context_rereads_agents_md_for_do_not_inject_compaction() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    std::fs::write(workspace.path().join("AGENTS.md"), "old project rule")
+        .expect("write initial AGENTS.md");
+    let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.cwd = workspace.path().abs();
+        },
+    )
+    .await;
+    session
+        .services
+        .agents_md_manager
+        .force_refresh(&turn_context.config, &turn_context.environments)
+        .await;
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    std::fs::write(workspace.path().join("AGENTS.md"), "new project rule")
+        .expect("update AGENTS.md");
+
+    let (_, initial_context_injection) = crate::compact::refresh_compaction_step_context(
+        &session,
+        &step_context,
+        crate::compact::InitialContextInjection::DoNotInject,
+    )
+    .await;
+
+    assert!(matches!(
+        initial_context_injection,
+        crate::compact::InitialContextInjection::DoNotInject
+    ));
+    let next_step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let world_state = session
+        .build_world_state_for_step(next_step_context.as_ref())
+        .await;
+    let initial_context = session
+        .build_initial_context_with_world_state(&turn_context, &world_state)
+        .await;
+    let user_text = user_input_texts(&initial_context).join("\n");
+    assert!(user_text.contains("new project rule"));
+    assert!(!user_text.contains("old project rule"));
+}
+
+#[tokio::test]
+async fn refresh_compaction_step_context_rereads_imported_agents_md_files() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    std::fs::write(workspace.path().join("AGENTS.md"), "@rules.md").expect("write AGENTS.md");
+    std::fs::write(workspace.path().join("rules.md"), "old imported rule")
+        .expect("write initial imported rules");
+    let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.cwd = workspace.path().abs();
+        },
+    )
+    .await;
+    session
+        .services
+        .agents_md_manager
+        .force_refresh(&turn_context.config, &turn_context.environments)
+        .await;
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    std::fs::write(workspace.path().join("rules.md"), "new imported rule")
+        .expect("update imported rules");
+
+    crate::compact::refresh_compaction_step_context(
+        &session,
+        &step_context,
+        crate::compact::InitialContextInjection::DoNotInject,
+    )
+    .await;
+
+    let next_step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let world_state = session
+        .build_world_state_for_step(next_step_context.as_ref())
+        .await;
+    let initial_context = session
+        .build_initial_context_with_world_state(&turn_context, &world_state)
+        .await;
+    let user_text = user_input_texts(&initial_context).join("\n");
+    assert!(user_text.contains("@rules.md"));
+    assert!(user_text.contains("new imported rule"));
+    assert!(!user_text.contains("old imported rule"));
+}
+
+#[tokio::test]
+async fn refresh_compaction_step_context_rereads_agents_md_for_mid_turn_injection() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    std::fs::write(workspace.path().join("AGENTS.md"), "old mid-turn rule")
+        .expect("write initial AGENTS.md");
+    let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.cwd = workspace.path().abs();
+        },
+    )
+    .await;
+    session
+        .services
+        .agents_md_manager
+        .force_refresh(&turn_context.config, &turn_context.environments)
+        .await;
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let stale_world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
+    std::fs::write(workspace.path().join("AGENTS.md"), "new mid-turn rule")
+        .expect("update AGENTS.md");
+
+    let (_, initial_context_injection) = crate::compact::refresh_compaction_step_context(
+        &session,
+        &step_context,
+        crate::compact::InitialContextInjection::BeforeLastUserMessage(stale_world_state),
+    )
+    .await;
+
+    let crate::compact::InitialContextInjection::BeforeLastUserMessage(world_state) =
+        initial_context_injection
+    else {
+        panic!("expected mid-turn compaction to keep initial context injection");
+    };
+    let initial_context = session
+        .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
+        .await;
+    let user_text = user_input_texts(&initial_context).join("\n");
+    assert!(user_text.contains("new mid-turn rule"));
+    assert!(!user_text.contains("old mid-turn rule"));
 }
 
 #[tokio::test]
@@ -9779,6 +10064,74 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
         .expect("idle receiver open");
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn send_event_notifies_turn_event_contributors() {
+    struct TurnEventRecorder {
+        event_tx: async_channel::Sender<(String, String, String, String, String)>,
+    }
+
+    impl codex_extension_api::TurnEventContributor for TurnEventRecorder {
+        fn on_turn_event<'a>(
+            &'a self,
+            input: codex_extension_api::TurnEventInput<'a>,
+        ) -> codex_extension_api::TurnEventFuture<'a> {
+            Box::pin(async move {
+                let message = match input.event {
+                    codex_protocol::protocol::EventMsg::Warning(event) => event.message.clone(),
+                    other => panic!("unexpected event for test: {other:?}"),
+                };
+                self.event_tx
+                    .send((
+                        input.session_store.level_id().to_string(),
+                        input.thread_store.level_id().to_string(),
+                        input.turn_store.level_id().to_string(),
+                        input.turn_id.to_string(),
+                        message,
+                    ))
+                    .await
+                    .expect("turn event receiver open");
+            })
+        }
+    }
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    let expected_session_id = session
+        .services
+        .session_extension_data
+        .level_id()
+        .to_string();
+    let expected_thread_id = session
+        .services
+        .thread_extension_data
+        .level_id()
+        .to_string();
+    let expected_turn_id = turn_context.sub_id.clone();
+    let (event_tx, event_rx) = async_channel::bounded(1);
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_event_contributor(Arc::new(TurnEventRecorder { event_tx }));
+    session.services.extensions = Arc::new(builder.build());
+
+    session
+        .send_event(
+            &turn_context,
+            codex_protocol::protocol::EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                message: "turn event hook".to_string(),
+            }),
+        )
+        .await;
+
+    let (session_id, thread_id, turn_store_id, turn_id, message) =
+        timeout(StdDuration::from_secs(2), event_rx.recv())
+            .await
+            .expect("turn event contributor call")
+            .expect("turn event receiver open");
+    assert_eq!(expected_session_id, session_id);
+    assert_eq!(expected_thread_id, thread_id);
+    assert_eq!(expected_turn_id, turn_store_id);
+    assert_eq!(expected_turn_id, turn_id);
+    assert_eq!("turn event hook", message);
 }
 
 #[tokio::test]

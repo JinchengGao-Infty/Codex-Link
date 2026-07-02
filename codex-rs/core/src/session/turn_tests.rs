@@ -1,8 +1,13 @@
 use super::*;
+use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::session::turn_context::TurnEnvironment;
+use codex_exec_server::Environment;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
 use codex_protocol::items::AgentMessageContent;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
+use std::path::Path;
 use std::sync::Arc;
 
 struct RewriteAgentMessageContributor;
@@ -35,6 +40,63 @@ fn assistant_output_text(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+fn local_environments(cwd: &Path) -> TurnEnvironmentSnapshot {
+    TurnEnvironmentSnapshot {
+        turn_environments: vec![TurnEnvironment::new(
+            "local".to_string(),
+            Arc::new(Environment::create_for_tests(/*exec_server_url*/ None).expect("environment")),
+            PathUri::from_host_native_path(cwd).expect("cwd URI"),
+            /*shell*/ None,
+        )],
+        starting: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn agents_md_focus_paths_are_collected_from_text_file_paths() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let environments = local_environments(cwd.path());
+    let input = vec![TurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "fix `codex-rs/tui/src/app.rs`, then check https://example.com/a/b".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
+    }];
+
+    let focus_paths = collect_agents_md_focus_paths(&input, &environments);
+    let expected_path = environments.turn_environments[0]
+        .cwd()
+        .join("codex-rs/tui/src/app.rs")
+        .expect("expected focus path");
+
+    assert_eq!(
+        focus_paths,
+        vec![AgentsMdFocusPath {
+            environment_id: "local".to_string(),
+            path: expected_path,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn agents_md_focus_paths_ignore_urls_and_non_path_text() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let environments = local_environments(cwd.path());
+    let input = vec![TurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "read https://example.com/a/b and summarize normally".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
+    }];
+
+    assert_eq!(
+        collect_agents_md_focus_paths(&input, &environments),
+        Vec::<AgentsMdFocusPath>::new()
+    );
 }
 
 #[tokio::test]

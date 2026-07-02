@@ -47,6 +47,7 @@ use codex_app_server_protocol::NetworkPolicyAmendment as V2NetworkPolicyAmendmen
 use codex_app_server_protocol::NetworkPolicyRuleAction as V2NetworkPolicyRuleAction;
 use codex_app_server_protocol::PermissionsRequestApprovalParams;
 use codex_app_server_protocol::PermissionsRequestApprovalResponse;
+use codex_app_server_protocol::PlanDeltaNotification;
 use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
@@ -90,6 +91,7 @@ use codex_core::ThreadManager;
 use codex_core::review_format::format_review_findings_block;
 use codex_core::review_prompts;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
 use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -866,6 +868,20 @@ pub(crate) async fn apply_bespoke_event_handling(
             // Deprecated MCP tool-call events are still fanned out for legacy clients.
             // App-server v2 receives the canonical TurnItem::McpToolCall lifecycle instead.
         }
+        EventMsg::PlanDelta(event) => {
+            thread_state
+                .lock()
+                .await
+                .turn_summary
+                .plan_delta_item_ids
+                .insert(event.item_id.clone());
+            let notification = item_event_to_server_notification(
+                EventMsg::PlanDelta(event),
+                &conversation_id.to_string(),
+                &event_turn_id,
+            );
+            outgoing.send_server_notification(notification).await;
+        }
         msg @ (EventMsg::DynamicToolCallResponse(_)
         | EventMsg::CollabAgentSpawnBegin(_)
         | EventMsg::CollabAgentSpawnEnd(_)
@@ -877,7 +893,6 @@ pub(crate) async fn apply_bespoke_event_handling(
         | EventMsg::CollabResumeBegin(_)
         | EventMsg::CollabResumeEnd(_)
         | EventMsg::AgentMessageContentDelta(_)
-        | EventMsg::PlanDelta(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)) => {
@@ -1028,11 +1043,38 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         msg @ (EventMsg::ItemStarted(_)
-        | EventMsg::ItemCompleted(_)
         | EventMsg::PatchApplyUpdated(_)
-        | EventMsg::TerminalInteraction(_)) => {
+        | EventMsg::TerminalInteraction(_)
+        | EventMsg::ExecBackgroundTrigger(_)) => {
             let notification = item_event_to_server_notification(
                 msg,
+                &conversation_id.to_string(),
+                &event_turn_id,
+            );
+            outgoing.send_server_notification(notification).await;
+        }
+        EventMsg::ItemCompleted(event) => {
+            if let TurnItem::Plan(plan) = &event.item {
+                let should_emit_delta = thread_state
+                    .lock()
+                    .await
+                    .turn_summary
+                    .plan_delta_item_ids
+                    .insert(plan.id.clone());
+                if should_emit_delta {
+                    let notification = PlanDeltaNotification {
+                        thread_id: conversation_id.to_string(),
+                        turn_id: event.turn_id.clone(),
+                        item_id: plan.id.clone(),
+                        delta: plan.text.clone(),
+                    };
+                    outgoing
+                        .send_server_notification(ServerNotification::PlanDelta(notification))
+                        .await;
+                }
+            }
+            let notification = item_event_to_server_notification(
+                EventMsg::ItemCompleted(event),
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
@@ -1398,6 +1440,8 @@ async fn start_command_execution_item(
                 command,
                 cwd,
                 process_id: None,
+                background_description: None,
+                background_triggers: Vec::new(),
                 source,
                 status: CommandExecutionStatus::InProgress,
                 command_actions,
@@ -1442,6 +1486,8 @@ async fn complete_command_execution_item(
         command,
         cwd,
         process_id,
+        background_description: None,
+        background_triggers: Vec::new(),
         source,
         status,
         command_actions,
@@ -2617,6 +2663,8 @@ mod tests {
                         command: completion_item.command.clone(),
                         cwd: completion_item.cwd.clone(),
                         process_id: None,
+                        background_description: None,
+                        background_triggers: Vec::new(),
                         source: CommandExecutionSource::Agent,
                         status: CommandExecutionStatus::InProgress,
                         command_actions: completion_item.command_actions.clone(),

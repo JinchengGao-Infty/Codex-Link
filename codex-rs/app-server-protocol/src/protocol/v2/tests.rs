@@ -2668,6 +2668,8 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             command: "echo done".to_string(),
             cwd: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp").abs()),
             process_id: Some("pid-1".to_string()),
+            background_description: None,
+            background_triggers: Vec::new(),
             source: CommandExecutionSource::Agent,
             status: CommandExecutionStatus::Completed,
             command_actions: vec![CommandAction::Unknown {
