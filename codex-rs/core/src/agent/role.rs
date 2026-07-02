@@ -27,7 +27,17 @@ use toml::Value as TomlValue;
 
 /// The role name used when a caller omits `agent_type`.
 pub const DEFAULT_ROLE_NAME: &str = "default";
+pub(crate) const EXPLORER_ROLE_NAME: &str = "explorer";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
+
+/// Roles whose spawned agents must be clamped to a read-only sandbox.
+///
+/// Role config files cannot express this: the spawn path re-applies the
+/// parent turn's permission profile after the role layer, so read-only
+/// enforcement has to happen in the spawn handlers themselves.
+pub(crate) fn role_enforces_read_only(role_name: Option<&str>) -> bool {
+    role_name == Some(EXPLORER_ROLE_NAME)
+}
 
 /// Applies a named role layer to `config` while preserving caller-owned provider settings.
 ///
@@ -71,14 +81,23 @@ async fn apply_role_to_config_inner(
     }
     let preserve_current_provider = role_layer_toml.get("model_provider").is_none();
     let preserve_current_service_tier = role_layer_toml.get("service_tier").is_none();
+    let preserve_current_model = role_layer_toml.get("model").is_none();
+    let preserve_current_reasoning_effort = role_layer_toml.get("model_reasoning_effort").is_none();
+    let current_reasoning_effort = config.model_reasoning_effort.clone();
 
     *config = reload::build_next_config(
         config,
         role_layer_toml,
         preserve_current_provider,
         preserve_current_service_tier,
+        preserve_current_model,
     )
     .await?;
+    // `ConfigOverrides` has no reasoning-effort slot, so restore the caller's
+    // sticky runtime choice after the rebuild unless the role pinned one.
+    if preserve_current_reasoning_effort {
+        config.model_reasoning_effort = current_reasoning_effort;
+    }
     Ok(())
 }
 
@@ -134,6 +153,7 @@ mod reload {
         role_layer_toml: TomlValue,
         preserve_current_provider: bool,
         preserve_current_service_tier: bool,
+        preserve_current_model: bool,
     ) -> anyhow::Result<Config> {
         let config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
         let merged_config = deserialize_effective_config(config, &config_layer_stack)?;
@@ -145,6 +165,7 @@ mod reload {
                 config,
                 preserve_current_provider,
                 preserve_current_service_tier,
+                preserve_current_model,
             ),
             config.codex_home.clone(),
             config_layer_stack,
@@ -202,9 +223,13 @@ mod reload {
         config: &Config,
         preserve_current_provider: bool,
         preserve_current_service_tier: bool,
+        preserve_current_model: bool,
     ) -> ConfigOverrides {
         ConfigOverrides {
             cwd: Some(config.cwd.to_path_buf()),
+            model: preserve_current_model
+                .then(|| config.model.clone())
+                .flatten(),
             model_provider: preserve_current_provider.then(|| config.model_provider_id.clone()),
             service_tier: preserve_current_service_tier.then(|| config.service_tier.clone()),
             codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
@@ -318,11 +343,12 @@ mod built_in {
                     }
                 ),
                 (
-                    "explorer".to_string(),
+                    EXPLORER_ROLE_NAME.to_string(),
                     AgentRoleConfig {
                         description: Some(r#"Use `explorer` for specific codebase questions.
 Explorers are fast and authoritative.
 They must be used to ask specific, well-scoped questions on the codebase.
+Explorers run in a read-only sandbox: they cannot edit files or run state-changing commands, and they answer with concise findings plus file:line provenance instead of raw file dumps.
 Rules:
 - In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
 - You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. This allows you to get more information faster without waiting for one question to finish before asking the next. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results. This parallelism is a key advantage of delegation, so use it whenever you have multiple questions to ask.

@@ -4,6 +4,7 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::agent::role::role_enforces_read_only;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::turn_timing::now_unix_timestamp_ms;
@@ -91,6 +92,11 @@ async fn handle_spawn_agent(
     )
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    // After the runtime overrides restore the parent's permission profile,
+    // clamp read-only roles back down; role config layers cannot do this.
+    if role_enforces_read_only(role_name) {
+        enforce_read_only_role_permissions(&mut config)?;
+    }
 
     let spawn_source = thread_spawn_source(
         session.thread_id,

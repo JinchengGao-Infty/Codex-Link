@@ -250,6 +250,26 @@ pub(crate) fn reject_full_fork_spawn_overrides(
 ///
 /// These values are chosen by the live turn rather than persisted config, so leaving them stale
 /// can make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
+/// Clamps a spawned agent to a read-only sandbox with no approval prompts,
+/// mirroring the guardian review session. Must run after
+/// `apply_spawn_agent_runtime_overrides`, which re-applies the parent turn's
+/// permission profile and would otherwise undo the clamp.
+pub(crate) fn enforce_read_only_role_permissions(
+    config: &mut Config,
+) -> Result<(), FunctionCallError> {
+    config.permissions.approval_policy =
+        crate::config::Constrained::allow_only(codex_protocol::protocol::AskForApproval::Never);
+    config
+        .permissions
+        .set_permission_profile(codex_protocol::models::PermissionProfile::read_only())
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "read-only role could not set permission profile: {err}"
+            ))
+        })?;
+    Ok(())
+}
+
 pub(crate) fn apply_spawn_agent_runtime_overrides(
     config: &mut Config,
     turn: &TurnContext,

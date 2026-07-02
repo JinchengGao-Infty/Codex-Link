@@ -251,7 +251,7 @@ async fn spawn_agent_rejects_when_message_and_items_are_both_set() {
 }
 
 #[tokio::test]
-async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
+async fn spawn_agent_clamps_explorer_role_to_read_only() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -261,7 +261,18 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
-    let mut config = (*turn.config).clone();
+    // The explorer role has a non-empty config layer, so spawn rebuilds the
+    // child config from the layer stack. Seed the model as a CLI layer so it
+    // survives that rebuild the way a real session's model override does.
+    let mut config = crate::config::ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(turn.config.codex_home.to_path_buf())
+        .cli_overrides(vec![(
+            "model".to_string(),
+            toml::Value::String("gpt-5.2".to_string()),
+        )])
+        .build()
+        .await
+        .expect("test config should build");
     let provider_info =
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["ollama"].clone();
     config.model_provider_id = "ollama".to_string();
@@ -306,7 +317,14 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
         .expect("spawned agent thread should exist")
         .config_snapshot()
         .await;
-    assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
+    // Explorers are reconnaissance agents: regardless of the parent's
+    // approval policy and permission profile, the spawn path clamps them to
+    // a read-only sandbox that never prompts.
+    assert_eq!(snapshot.approval_policy, AskForApproval::Never);
+    assert_eq!(
+        snapshot.permission_profile,
+        codex_protocol::models::PermissionProfile::read_only()
+    );
     assert_eq!(snapshot.model_provider_id, "ollama");
 }
 
@@ -2360,6 +2378,10 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         turn.config.permissions.effective_permission_profile(),
         "test requires a runtime profile override that differs from base config"
     );
+    // Use a user-defined role: this test verifies that runtime sandbox
+    // overrides are re-applied after a role config layer, which requires a
+    // role that does not itself clamp permissions (explorer now does).
+    let role_name = install_role_with_model_override(&mut turn).await;
 
     let invocation = invocation(
         Arc::new(session),
@@ -2367,7 +2389,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         "spawn_agent",
         function_payload(json!({
             "message": "await this command",
-            "agent_type": "explorer"
+            "agent_type": role_name
         })),
     );
     let output = SpawnAgentHandler::default()
