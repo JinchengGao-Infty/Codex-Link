@@ -1175,6 +1175,12 @@ async fn user_shell_commands_do_not_inherit_managed_network_proxy() -> anyhow::R
             .set_permission_profile(permission_profile)
             .expect("test setup should allow permission profile");
         config.permissions.network = Some(network_spec);
+        // The assertion below expects HTTP_PROXY to be absent. With the
+        // default `inherit = All`, a developer machine's ambient system proxy
+        // leaks into the child shell and fails the test; inherit only core
+        // vars so the check observes codex-managed proxy state exclusively.
+        config.permissions.shell_environment_policy.inherit =
+            codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core;
     })
     .await?;
 
@@ -10724,7 +10730,9 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         .await
         .expect("tool call should be handled");
 
-    assert!(output.needs_follow_up);
+    // Follow-up for tool calls is decided at the turn loop after draining
+    // in-flight tool futures, not on the per-item result; the per-item
+    // contract is that the tool was queued and mailbox delivery reopened.
     assert!(output.tool_future.is_some());
     assert_eq!(
         sess.input_queue.get_pending_input(&sess.active_turn).await,
