@@ -823,6 +823,8 @@ pub(super) fn begin_exec_with_source(
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
         process_id: None,
+        background_description: None,
+        background_triggers: Vec::new(),
         source,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions,
@@ -846,6 +848,8 @@ pub(super) fn begin_unified_exec_startup(
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
         process_id: Some(process_id.to_string()),
+        background_description: None,
+        background_triggers: Vec::new(),
         source: ExecCommandSource::UnifiedExecStartup,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions: Vec::new(),
@@ -891,6 +895,42 @@ pub(super) fn terminal_interaction(
                 item_id: call_id.to_string(),
                 process_id: process_id.to_string(),
                 stdin: stdin.to_string(),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+}
+
+pub(super) struct BackgroundTriggerSpec {
+    pub(super) call_id: String,
+    pub(super) process_id: String,
+    pub(super) description: Option<String>,
+    pub(super) declared_triggers: Vec<String>,
+    pub(super) trigger: String,
+    pub(super) reason: String,
+    pub(super) output_tail: String,
+}
+
+pub(super) fn command_execution_background_trigger(
+    chat: &mut ChatWidget,
+    spec: BackgroundTriggerSpec,
+) {
+    chat.handle_server_notification(
+        ServerNotification::CommandExecutionBackgroundTrigger(
+            codex_app_server_protocol::CommandExecutionBackgroundTriggerNotification {
+                thread_id: thread_id(chat),
+                turn_id: chat
+                    .turn_lifecycle
+                    .last_turn_id
+                    .clone()
+                    .unwrap_or_else(|| "turn-1".to_string()),
+                item_id: spec.call_id,
+                process_id: spec.process_id,
+                description: spec.description,
+                declared_triggers: spec.declared_triggers,
+                trigger: spec.trigger,
+                reason: spec.reason,
+                output_tail: spec.output_tail,
             },
         ),
         /*replay_kind*/ None,
@@ -1058,6 +1098,8 @@ pub(super) fn end_exec(
         command,
         cwd,
         process_id,
+        background_description,
+        background_triggers,
         source,
         command_actions,
         ..
@@ -1072,6 +1114,8 @@ pub(super) fn end_exec(
             command,
             cwd,
             process_id,
+            background_description,
+            background_triggers,
             source,
             status: if exit_code == 0 {
                 AppServerCommandExecutionStatus::Completed

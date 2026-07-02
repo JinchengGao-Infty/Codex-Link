@@ -1,11 +1,12 @@
 ---
-source: tui/src/history_cell.rs
+source: tui/src/history_cell/tests.rs
+assertion_line: 757
 expression: rendered
 ---
 /ps
 
 Background terminals
 
-  • just fix
+  • job process-1 · just fix
     ↳   indented first
           more indented

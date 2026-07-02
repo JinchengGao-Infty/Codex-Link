@@ -48,10 +48,22 @@ impl UnifiedExecFooter {
         }
 
         let count = self.processes.len();
-        let plural = if count == 1 { "" } else { "s" };
-        Some(format!(
-            "{count} background terminal{plural} running · /ps to view · /stop to close"
-        ))
+        if count == 1 {
+            let label = self.processes[0]
+                .lines()
+                .find_map(|line| {
+                    let line = line.trim();
+                    (!line.is_empty()).then_some(line)
+                })
+                .unwrap_or("job");
+            Some(format!(
+                "1 background job running: {label} · /ps details · /stop cancel"
+            ))
+        } else {
+            Some(format!(
+                "{count} background jobs running · /ps details · /stop cancel"
+            ))
+        }
     }
 
     fn render_lines(&self, width: u16) -> Vec<Line<'static>> {

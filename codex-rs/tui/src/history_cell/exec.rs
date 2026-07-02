@@ -115,7 +115,11 @@ impl UnifiedExecProcessesCell {
 
 #[derive(Debug, Clone)]
 pub(crate) struct UnifiedExecProcessDetails {
+    pub(crate) job_id: String,
     pub(crate) command_display: String,
+    pub(crate) background_description: Option<String>,
+    pub(crate) background_triggers: Vec<String>,
+    pub(crate) last_trigger: Option<String>,
     pub(crate) recent_chunks: Vec<String>,
 }
 
@@ -159,6 +163,7 @@ impl HistoryCell for UnifiedExecProcessesCell {
                     (first_line.to_string(), has_more_lines)
                 }
             };
+            let snippet = format!("job {} · {snippet}", process.job_id);
             if wrap_width <= prefix_width {
                 out.push(Line::from(prefix.dim()));
                 shown += 1;
@@ -179,6 +184,34 @@ impl HistoryCell for UnifiedExecProcessesCell {
             } else {
                 let (truncated, _, _) = take_prefix_by_width(&snippet, budget);
                 out.push(vec![prefix.dim(), truncated.cyan()].into());
+            }
+
+            if let Some(description) = &process.background_description {
+                push_process_detail_line(
+                    &mut out,
+                    wrap_width,
+                    "    purpose: ",
+                    description,
+                    truncation_suffix,
+                );
+            }
+            if !process.background_triggers.is_empty() {
+                push_process_detail_line(
+                    &mut out,
+                    wrap_width,
+                    "    triggers: ",
+                    &process.background_triggers.join("; "),
+                    truncation_suffix,
+                );
+            }
+            if let Some(trigger) = &process.last_trigger {
+                push_process_detail_line(
+                    &mut out,
+                    wrap_width,
+                    "    last trigger: ",
+                    trigger,
+                    truncation_suffix,
+                );
             }
 
             let chunk_prefix_first = "    ↳ ";
@@ -230,6 +263,31 @@ impl HistoryCell for UnifiedExecProcessesCell {
 
     fn desired_height(&self, width: u16) -> u16 {
         self.display_lines(width).len() as u16
+    }
+}
+
+fn push_process_detail_line(
+    out: &mut Vec<Line<'static>>,
+    wrap_width: usize,
+    prefix: &'static str,
+    text: &str,
+    truncation_suffix: &'static str,
+) {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    if wrap_width <= prefix_width {
+        out.push(Line::from(prefix.dim()));
+        return;
+    }
+
+    let budget = wrap_width.saturating_sub(prefix_width);
+    let truncation_suffix_width = UnicodeWidthStr::width(truncation_suffix);
+    let (truncated, remainder, _) = take_prefix_by_width(text, budget);
+    if !remainder.is_empty() && budget > truncation_suffix_width {
+        let available = budget.saturating_sub(truncation_suffix_width);
+        let (shorter, _, _) = take_prefix_by_width(text, available);
+        out.push(vec![prefix.dim(), shorter.dim(), truncation_suffix.dim()].into());
+    } else {
+        out.push(vec![prefix.dim(), truncated.dim()].into());
     }
 }
 

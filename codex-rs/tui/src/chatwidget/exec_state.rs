@@ -15,6 +15,9 @@ pub(super) struct UnifiedExecProcessSummary {
     pub(super) key: String,
     pub(super) call_id: String,
     pub(super) command_display: String,
+    pub(super) background_description: Option<String>,
+    pub(super) background_triggers: Vec<String>,
+    pub(super) last_trigger: Option<String>,
     pub(super) recent_chunks: Vec<String>,
 }
 

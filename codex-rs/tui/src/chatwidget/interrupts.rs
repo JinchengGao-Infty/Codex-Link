@@ -179,6 +179,8 @@ mod tests {
             command: "true".to_string(),
             cwd: AbsolutePathBuf::current_dir().expect("current dir").into(),
             process_id: None,
+            background_description: None,
+            background_triggers: Vec::new(),
             source: CommandExecutionSource::Agent,
             status: CommandExecutionStatus::InProgress,
             command_actions: Vec::new(),

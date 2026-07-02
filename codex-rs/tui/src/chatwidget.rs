@@ -1463,7 +1463,11 @@ impl ChatWidget {
             .unified_exec_processes
             .iter()
             .map(|process| history_cell::UnifiedExecProcessDetails {
+                job_id: process.key.clone(),
                 command_display: process.command_display.clone(),
+                background_description: process.background_description.clone(),
+                background_triggers: process.background_triggers.clone(),
+                last_trigger: process.last_trigger.clone(),
                 recent_chunks: process.recent_chunks.clone(),
             })
             .collect();

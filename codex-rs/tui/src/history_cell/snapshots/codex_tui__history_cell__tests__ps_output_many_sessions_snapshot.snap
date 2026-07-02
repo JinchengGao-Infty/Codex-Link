@@ -1,25 +1,26 @@
 ---
-source: tui/src/history_cell.rs
+source: tui/src/history_cell/tests.rs
+assertion_line: 743
 expression: rendered
 ---
 /ps
 
 Background terminals
 
-  • command 0
-  • command 1
-  • command 2
-  • command 3
-  • command 4
-  • command 5
-  • command 6
-  • command 7
-  • command 8
-  • command 9
-  • command 10
-  • command 11
-  • command 12
-  • command 13
-  • command 14
-  • command 15
+  • job process-0 · command 0
+  • job process-1 · command 1
+  • job process-2 · command 2
+  • job process-3 · command 3
+  • job process-4 · command 4
+  • job process-5 · command 5
+  • job process-6 · command 6
+  • job process-7 · command 7
+  • job process-8 · command 8
+  • job process-9 · command 9
+  • job process-10 · command 10
+  • job process-11 · command 11
+  • job process-12 · command 12
+  • job process-13 · command 13
+  • job process-14 · command 14
+  • job process-15 · command 15
   • ... and 4 more running

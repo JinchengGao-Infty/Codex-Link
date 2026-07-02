@@ -680,11 +680,22 @@ async fn session_info_hides_tooltips_when_disabled() {
 fn ps_output_multiline_snapshot() {
     let cell = new_unified_exec_processes_output(vec![
         UnifiedExecProcessDetails {
+            job_id: "process-1".to_string(),
             command_display: "echo hello\nand then some extra text".to_string(),
+            background_description: Some("train model until val_loss < 0.30".to_string()),
+            background_triggers: vec![
+                "metric_threshold val_loss < 0.30".to_string(),
+                "plateau val_loss patience=10 min_delta=0.001".to_string(),
+            ],
+            last_trigger: Some("plateau: val_loss stalled for 10 epochs".to_string()),
             recent_chunks: vec!["hello".to_string(), "done".to_string()],
         },
         UnifiedExecProcessDetails {
+            job_id: "process-2".to_string(),
             command_display: "rg \"foo\" src".to_string(),
+            background_description: None,
+            background_triggers: Vec::new(),
+            last_trigger: None,
             recent_chunks: vec!["src/main.rs:12:foo".to_string()],
         },
     ]);
@@ -716,9 +727,13 @@ fn cyber_policy_error_event_narrow_snapshot() {
 #[test]
 fn ps_output_long_command_snapshot() {
     let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
+        job_id: "process-1".to_string(),
         command_display: String::from(
             "rg \"foo\" src --glob '**/*.rs' --max-count 1000 --no-ignore --hidden --follow --glob '!target/**'",
         ),
+        background_description: None,
+        background_triggers: Vec::new(),
+        last_trigger: None,
         recent_chunks: vec!["searching...".to_string()],
     }]);
     let rendered = render_lines(&cell.display_lines(/*width*/ 36)).join("\n");
@@ -730,7 +745,11 @@ fn ps_output_many_sessions_snapshot() {
     let cell = new_unified_exec_processes_output(
         (0..20)
             .map(|idx| UnifiedExecProcessDetails {
+                job_id: format!("process-{idx}"),
                 command_display: format!("command {idx}"),
+                background_description: None,
+                background_triggers: Vec::new(),
+                last_trigger: None,
                 recent_chunks: Vec::new(),
             })
             .collect(),
@@ -742,7 +761,11 @@ fn ps_output_many_sessions_snapshot() {
 #[test]
 fn ps_output_chunk_leading_whitespace_snapshot() {
     let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
+        job_id: "process-1".to_string(),
         command_display: "just fix".to_string(),
+        background_description: None,
+        background_triggers: Vec::new(),
+        last_trigger: None,
         recent_chunks: vec![
             "  indented first".to_string(),
             "    more indented".to_string(),

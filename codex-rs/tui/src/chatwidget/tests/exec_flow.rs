@@ -365,6 +365,8 @@ async fn exec_end_without_begin_uses_event_command() {
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),
             process_id: None,
+            background_description: None,
+            background_triggers: Vec::new(),
             source: ExecCommandSource::Agent,
             status: AppServerCommandExecutionStatus::Completed,
             command_actions,
@@ -706,6 +708,9 @@ async fn unified_exec_wait_status_header_updates_on_late_command_display() {
         key: "proc-1".to_string(),
         call_id: "call-1".to_string(),
         command_display: "sleep 5".to_string(),
+        background_description: None,
+        background_triggers: Vec::new(),
+        last_trigger: None,
         recent_chunks: Vec::new(),
     });
 
@@ -1323,6 +1328,52 @@ async fn interrupt_preserves_unified_exec_processes() {
     );
 
     let _ = drain_insert_history(&mut rx);
+}
+
+#[tokio::test]
+async fn background_trigger_updates_ps_output() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    begin_unified_exec_startup(&mut chat, "call-1", "process-1", "python train.py");
+    command_execution_background_trigger(
+        &mut chat,
+        BackgroundTriggerSpec {
+            call_id: "call-1".to_string(),
+            process_id: "process-1".to_string(),
+            description: Some("train until val_loss < 0.30".to_string()),
+            declared_triggers: vec![
+                "metric_threshold val_loss < 0.30".to_string(),
+                "plateau val_loss patience=10".to_string(),
+            ],
+            trigger: "metric_plateau".to_string(),
+            reason: "val_loss stalled for 10 epochs".to_string(),
+            output_tail: "epoch=48 val_loss=0.418\n".to_string(),
+        },
+    );
+
+    chat.add_ps_output();
+    let cells = drain_insert_history(&mut rx);
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("purpose: train until val_loss < 0.30"),
+        "expected /ps to show background purpose; got {combined:?}"
+    );
+    assert!(
+        combined.contains("metric_threshold val_loss < 0.30"),
+        "expected /ps to show declared triggers; got {combined:?}"
+    );
+    assert!(
+        combined.contains("last trigger: metric_plateau: val_loss stalled for 10 epochs"),
+        "expected /ps to show last trigger; got {combined:?}"
+    );
+    assert!(
+        combined.contains("epoch=48 val_loss=0.418"),
+        "expected /ps to show trigger output tail; got {combined:?}"
+    );
 }
 
 #[tokio::test]

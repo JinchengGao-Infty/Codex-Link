@@ -1,3 +1,4 @@
+use super::command_lifecycle::CommandExecutionBackgroundTriggerUpdate;
 use super::*;
 
 impl ChatWidget {
@@ -88,6 +89,19 @@ impl ChatWidget {
             ServerNotification::ReasoningSummaryPartAdded(_) => self.on_reasoning_section_break(),
             ServerNotification::TerminalInteraction(notification) => {
                 self.on_terminal_interaction(notification.process_id, notification.stdin)
+            }
+            ServerNotification::CommandExecutionBackgroundTrigger(notification) => {
+                self.on_command_execution_background_trigger(
+                    CommandExecutionBackgroundTriggerUpdate {
+                        call_id: notification.item_id,
+                        process_id: notification.process_id,
+                        background_description: notification.description,
+                        background_triggers: notification.declared_triggers,
+                        trigger: notification.trigger,
+                        reason: notification.reason,
+                        output_tail: notification.output_tail,
+                    },
+                );
             }
             ServerNotification::CommandExecutionOutputDelta(notification) => {
                 self.on_exec_command_output_delta(&notification.item_id, &notification.delta);

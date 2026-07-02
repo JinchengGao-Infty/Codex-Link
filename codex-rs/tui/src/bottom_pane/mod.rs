@@ -2462,7 +2462,7 @@ mod tests {
 
         let area = Rect::new(0, 0, width, after);
         let rendered = render_snapshot(&pane, area);
-        assert!(rendered.contains("background terminal running · /ps to view"));
+        assert!(rendered.contains("background job running: sleep 5 · /ps details"));
     }
 
     #[test]

@@ -5,6 +5,16 @@
 
 use super::*;
 
+pub(super) struct CommandExecutionBackgroundTriggerUpdate {
+    pub(super) call_id: String,
+    pub(super) process_id: String,
+    pub(super) background_description: Option<String>,
+    pub(super) background_triggers: Vec<String>,
+    pub(super) trigger: String,
+    pub(super) reason: String,
+    pub(super) output_tail: String,
+}
+
 impl ChatWidget {
     pub(super) fn flush_unified_exec_wait_streak(&mut self) {
         let Some(wait) = self.unified_exec_wait_streak.take() else {
@@ -22,6 +32,8 @@ impl ChatWidget {
             id,
             command,
             process_id,
+            background_description,
+            background_triggers,
             source,
             command_actions,
             ..
@@ -33,7 +45,13 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
         if is_unified_exec_source(*source) {
             if *source == ExecCommandSource::UnifiedExecStartup {
-                self.track_unified_exec_process_begin(id, process_id.as_deref(), command);
+                self.track_unified_exec_process_begin(
+                    id,
+                    process_id.as_deref(),
+                    command,
+                    background_description.clone(),
+                    background_triggers.clone(),
+                );
             }
             if !self.bottom_pane.is_task_running() {
                 return;
@@ -167,6 +185,8 @@ impl ChatWidget {
         call_id: &str,
         process_id: Option<&str>,
         command: &str,
+        background_description: Option<String>,
+        background_triggers: Vec<String>,
     ) {
         let key = process_id.unwrap_or(call_id).to_string();
         let command = split_command_string(command);
@@ -178,12 +198,18 @@ impl ChatWidget {
         {
             existing.call_id = call_id.to_string();
             existing.command_display = command_display;
+            existing.background_description = background_description;
+            existing.background_triggers = background_triggers;
+            existing.last_trigger = None;
             existing.recent_chunks.clear();
         } else {
             self.unified_exec_processes.push(UnifiedExecProcessSummary {
                 key,
                 call_id: call_id.to_string(),
                 command_display,
+                background_description,
+                background_triggers,
+                last_trigger: None,
                 recent_chunks: Vec::new(),
             });
         }
@@ -208,7 +234,13 @@ impl ChatWidget {
         let processes = self
             .unified_exec_processes
             .iter()
-            .map(|process| process.command_display.clone())
+            .map(|process| {
+                process
+                    .background_description
+                    .clone()
+                    .filter(|description| !description.trim().is_empty())
+                    .unwrap_or_else(|| process.command_display.clone())
+            })
             .collect();
         self.bottom_pane.set_unified_exec_processes(processes);
     }
@@ -237,6 +269,36 @@ impl ChatWidget {
             let drop_count = process.recent_chunks.len() - MAX_RECENT_CHUNKS;
             process.recent_chunks.drain(0..drop_count);
         }
+    }
+
+    pub(super) fn on_command_execution_background_trigger(
+        &mut self,
+        update: CommandExecutionBackgroundTriggerUpdate,
+    ) {
+        let last_trigger = if update.reason.is_empty() {
+            update.trigger
+        } else {
+            format!("{}: {}", update.trigger, update.reason)
+        };
+        let Some(process) = self
+            .unified_exec_processes
+            .iter_mut()
+            .find(|process| process.key == update.process_id || process.call_id == update.call_id)
+        else {
+            return;
+        };
+        if process.background_description.is_none() {
+            process.background_description = update.background_description;
+        }
+        if process.background_triggers.is_empty() {
+            process.background_triggers = update.background_triggers;
+        }
+        process.last_trigger = Some(last_trigger);
+
+        if !update.output_tail.is_empty() {
+            self.track_unified_exec_output_chunk(&update.call_id, update.output_tail.as_bytes());
+        }
+        self.request_redraw();
     }
 
     pub(crate) fn handle_command_execution_started_now(&mut self, item: ThreadItem) {
