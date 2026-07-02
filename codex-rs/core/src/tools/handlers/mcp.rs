@@ -159,6 +159,11 @@ impl McpHandler {
             wall_time: started.elapsed(),
             original_image_detail_supported: can_request_original_image_detail(&turn.model_info),
             truncation_policy: turn.model_info.truncation_policy.into(),
+            spill: Some(crate::tools::output_spill::ToolOutputSpillParams {
+                codex_home: turn.config.codex_home.clone().to_path_buf(),
+                thread_id: session.thread_id(),
+                call_id,
+            }),
         }))
     }
 }
@@ -455,6 +460,7 @@ mod tests {
             wall_time: Duration::from_millis(42),
             original_image_detail_supported: true,
             truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1024),
+            spill: None,
         };
         let (session, turn) = make_session_and_context().await;
         let turn = Arc::new(turn);

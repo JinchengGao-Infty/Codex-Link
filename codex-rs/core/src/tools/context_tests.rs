@@ -101,6 +101,7 @@ fn mcp_tool_output_response_item_includes_wall_time() {
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
         truncation_policy: TruncationPolicy::Bytes(1024),
+        spill: None,
     };
 
     let response = output.to_response_item(
@@ -153,6 +154,7 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
         truncation_policy: TruncationPolicy::Bytes(128),
+        spill: None,
     };
 
     let response = output.to_response_item(
@@ -179,6 +181,85 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
 }
 
 #[test]
+fn mcp_tool_output_spills_truncated_text_to_sidecar_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let thread_id = codex_protocol::ThreadId::default();
+    let large_text = "mcp output line\n".repeat(4_000);
+    let output = McpToolOutput {
+        result: CallToolResult {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": large_text,
+            })],
+            structured_content: None,
+            is_error: Some(false),
+            meta: None,
+        },
+        tool_input: json!({}),
+        wall_time: std::time::Duration::from_millis(500),
+        original_image_detail_supported: false,
+        truncation_policy: TruncationPolicy::Bytes(10_000),
+        spill: Some(crate::tools::output_spill::ToolOutputSpillParams {
+            codex_home: dir.path().to_path_buf(),
+            thread_id,
+            call_id: "mcp-call-spill".to_string(),
+        }),
+    };
+
+    let response = output.to_response_item(
+        "mcp-call-spill",
+        &ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+    );
+
+    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        panic!("expected FunctionCallOutput");
+    };
+    let text = output
+        .body
+        .to_text()
+        .expect("MCP output should serialize as text");
+    assert!(
+        text.contains("chars truncated"),
+        "expected truncation: {text}"
+    );
+
+    let spill_path = dir
+        .path()
+        .join("link")
+        .join("tool-output")
+        .join(thread_id.to_string())
+        .join("mcp-call-spill.txt");
+    assert!(
+        text.contains(&format!(
+            "Full untruncated output saved to: {}",
+            spill_path.display()
+        )),
+        "expected spill pointer in: {text}"
+    );
+    // The pointer's cost is reserved from the body budget, so even after the
+    // history-recording layer re-truncates with the same policy the pointer
+    // must survive intact (truncation is middle-cut; the pointer is the tail).
+    let rerecorded =
+        truncate_function_output_payload(&output, TruncationPolicy::Bytes(10_000) * 1.2);
+    let rerecorded_text = rerecorded
+        .body
+        .to_text()
+        .expect("re-recorded output should stay text");
+    assert!(
+        rerecorded_text.contains(&format!(
+            "Full untruncated output saved to: {}",
+            spill_path.display()
+        )),
+        "history re-truncation cut the spill pointer: {rerecorded_text}"
+    );
+
+    let spilled = std::fs::read_to_string(&spill_path).expect("spill file should exist");
+    assert!(spilled.contains("mcp output line"));
+}
+
+#[test]
 fn mcp_tool_output_response_item_preserves_content_items() {
     let image_url = "data:image/png;base64,AAA";
     let output = McpToolOutput {
@@ -196,6 +277,7 @@ fn mcp_tool_output_response_item_preserves_content_items() {
         wall_time: std::time::Duration::from_millis(500),
         original_image_detail_supported: false,
         truncation_policy: TruncationPolicy::Bytes(1024),
+        spill: None,
     };
 
     let response = output.to_response_item(
@@ -250,6 +332,7 @@ fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result() {
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
         truncation_policy: TruncationPolicy::Bytes(64),
+        spill: None,
     };
 
     let result = output.code_mode_result(&ToolPayload::Function {

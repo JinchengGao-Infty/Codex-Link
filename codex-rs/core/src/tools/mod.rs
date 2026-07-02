@@ -95,35 +95,18 @@ pub fn format_exec_output_for_model(
     // budgets on dense content.
     let formatted_full = truncate_text(&content, truncation_policy);
     let truncated = formatted_full.len() != content.len();
-    // Below this budget the pointer line would displace the very content it
-    // points at, so tightly-capped outputs keep the plain truncation behavior.
-    const MIN_SPILL_BYTE_BUDGET: usize = 2_048;
-    let spill_section = if truncated && truncation_policy.byte_budget() >= MIN_SPILL_BYTE_BUDGET {
-        spill
-            .and_then(|spill| output_spill::spill_exec_output(&spill, &content))
-            .map(|full_output_path| {
-                format!(
-                    "Full untruncated output saved to: {} — if a detail from the truncated middle matters, search that file with rg/grep or tail it instead of re-running the command.",
-                    full_output_path.display()
-                )
-            })
-    } else {
-        None
-    };
-    // Reserve the pointer line's cost from the body budget so the combined
-    // message stays within the original policy and is not re-truncated by the
-    // history-recording layer (which would cut through the path itself).
+    let spill_section =
+        if truncated && truncation_policy.byte_budget() >= output_spill::MIN_SPILL_BYTE_BUDGET {
+            spill
+                .and_then(|spill| output_spill::spill_exec_output(&spill, &content))
+                .map(|full_output_path| {
+                    output_spill::spill_pointer_line(&full_output_path, "re-running the command")
+                })
+        } else {
+            None
+        };
     let body_policy = match &spill_section {
-        Some(section) => match truncation_policy {
-            TruncationPolicy::Bytes(bytes) => {
-                TruncationPolicy::Bytes(bytes.saturating_sub(section.len() + 1).max(1))
-            }
-            TruncationPolicy::Tokens(tokens) => TruncationPolicy::Tokens(
-                tokens
-                    .saturating_sub(codex_utils_output_truncation::approx_token_count(section) + 1)
-                    .max(1),
-            ),
-        },
+        Some(section) => output_spill::reserve_pointer_budget(truncation_policy, section),
         None => truncation_policy,
     };
 

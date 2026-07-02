@@ -73,11 +73,14 @@ pub struct McpToolOutput {
     pub wall_time: Duration,
     pub original_image_detail_supported: bool,
     pub truncation_policy: TruncationPolicy,
+    pub(crate) spill: Option<crate::tools::output_spill::ToolOutputSpillParams>,
 }
 
 impl ToolOutput for McpToolOutput {
     fn log_preview(&self) -> String {
-        let payload = self.response_payload();
+        // Preview only; use the plain truncated form so logging never spills.
+        let payload =
+            truncate_function_output_payload(&self.base_payload(), self.truncation_policy * 1.2);
         let preview = payload.body.to_text().unwrap_or_else(|| {
             serde_json::to_string(&self.result.content)
                 .unwrap_or_else(|err| format!("failed to serialize mcp result: {err}"))
@@ -112,7 +115,8 @@ impl ToolOutput for McpToolOutput {
 }
 
 impl McpToolOutput {
-    fn response_payload(&self) -> FunctionCallOutputPayload {
+    /// The image-sanitized, header-prefixed payload before any truncation.
+    fn base_payload(&self) -> FunctionCallOutputPayload {
         let mut payload = self.result.as_function_call_output_payload();
         if let Some(items) = payload.content_items_mut() {
             sanitize_original_image_detail(self.original_image_detail_supported, items);
@@ -133,6 +137,11 @@ impl McpToolOutput {
                 items.insert(0, FunctionCallOutputContentItem::InputText { text: header });
             }
         }
+        payload
+    }
+
+    fn response_payload(&self) -> FunctionCallOutputPayload {
+        let payload = self.base_payload();
 
         // This is the context-injection form, so keep it aligned with the
         // function-call output truncation that conversation history already
@@ -140,7 +149,12 @@ impl McpToolOutput {
         //
         // The text is serialized again inside the Responses payload, so allow
         // a small buffer for JSON escaping and wrapper overhead.
-        truncate_function_output_payload(&payload, self.truncation_policy * 1.2)
+        crate::tools::output_spill::truncate_payload_with_spill(
+            &payload,
+            self.truncation_policy * 1.2,
+            self.spill.as_ref(),
+            "re-calling the tool",
+        )
     }
 }
 

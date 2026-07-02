@@ -14,7 +14,9 @@ use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::protocol::DynamicToolCallResponseEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_tools::ResponsesApiNamespace;
@@ -25,6 +27,7 @@ use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 use codex_tools::default_namespace_description;
 use codex_tools::dynamic_tool_to_responses_api_tool;
+use codex_utils_output_truncation::TruncationPolicy;
 use serde_json::Value;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -137,7 +140,7 @@ impl DynamicToolHandler {
         let response = request_dynamic_tool(
             &session,
             turn.as_ref(),
-            call_id,
+            call_id.clone(),
             self.tool_name.clone(),
             args,
         )
@@ -156,6 +159,31 @@ impl DynamicToolHandler {
             .into_iter()
             .map(FunctionCallOutputContentItem::from)
             .collect::<Vec<_>>();
+        // Dynamic tool output is otherwise truncated only by the
+        // history-recording layer; run the spill-aware truncation here (same
+        // budget as that layer) so oversized output leaves a searchable
+        // archive instead of silently losing its middle.
+        let payload = FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(body),
+            success: Some(success),
+        };
+        let spill = crate::tools::output_spill::ToolOutputSpillParams {
+            codex_home: turn.config.codex_home.clone().to_path_buf(),
+            thread_id: session.thread_id(),
+            call_id,
+        };
+        let processed = crate::tools::output_spill::truncate_payload_with_spill(
+            &payload,
+            TruncationPolicy::from(turn.model_info.truncation_policy) * 1.2,
+            Some(&spill),
+            "re-calling the tool",
+        );
+        let body = match processed.body {
+            FunctionCallOutputBody::ContentItems(items) => items,
+            FunctionCallOutputBody::Text(text) => {
+                vec![FunctionCallOutputContentItem::InputText { text }]
+            }
+        };
         Ok(boxed_tool_output(FunctionToolOutput::from_content(
             body,
             Some(success),
