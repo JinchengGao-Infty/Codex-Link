@@ -203,6 +203,9 @@ struct ProcessEntry {
     background_triggers: Vec<String>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+    /// Wall-clock start, for model-facing observation output ("started Ns
+    /// ago"); `last_used` is monotonic and serves pruning instead.
+    started_at_unix_ms: i64,
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {

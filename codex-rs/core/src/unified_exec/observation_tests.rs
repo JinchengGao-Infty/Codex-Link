@@ -17,6 +17,7 @@ fn completed_snapshot(process_id: i32, exit_code: Option<i32>) -> JobSnapshot {
         background_triggers: Vec::new(),
         running: false,
         exit_code,
+        started_at_unix_ms: 0,
     }
 }
 

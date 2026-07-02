@@ -1,7 +1,18 @@
+use super::format_elapsed;
 use super::read_log_range;
 use super::read_log_tail;
 use super::truncate_command;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn elapsed_renders_coarse_units() {
+    assert_eq!(format_elapsed(-5), "0s");
+    assert_eq!(format_elapsed(34_000), "34s");
+    assert_eq!(format_elapsed(119_000), "119s");
+    assert_eq!(format_elapsed(120_000), "2m");
+    assert_eq!(format_elapsed(90 * 60_000), "90m");
+    assert_eq!(format_elapsed(3 * 3_600_000), "3h");
+}
 
 #[test]
 fn tail_returns_last_lines_and_total_size() {

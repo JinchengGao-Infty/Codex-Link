@@ -140,6 +140,7 @@ async fn exec_command_with_tty(
             background_triggers: Vec::new(),
             session: Arc::downgrade(session),
             last_used: started_at,
+            started_at_unix_ms: crate::turn_timing::now_unix_timestamp_ms(),
         };
         manager
             .process_store
@@ -1069,6 +1070,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             background_triggers: Vec::new(),
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
+            started_at_unix_ms: crate::turn_timing::now_unix_timestamp_ms(),
         },
     );
 
@@ -1144,6 +1146,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             background_triggers: Vec::new(),
             session: Arc::downgrade(&session),
             last_used,
+            started_at_unix_ms: crate::turn_timing::now_unix_timestamp_ms(),
         },
     );
 

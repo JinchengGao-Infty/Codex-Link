@@ -26,6 +26,9 @@ pub(crate) struct JobSnapshot {
     pub(crate) background_triggers: Vec<String>,
     pub(crate) running: bool,
     pub(crate) exit_code: Option<i32>,
+    /// Wall-clock start (unix ms). No end timestamp: exited entries are
+    /// reaped lazily, so stamping one at archive time would overstate runtime.
+    pub(crate) started_at_unix_ms: i64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -146,5 +149,6 @@ fn snapshot_entry(entry: &super::ProcessEntry) -> JobSnapshot {
         background_triggers: entry.background_triggers.clone(),
         running: !entry.process.has_exited(),
         exit_code: entry.process.exit_code(),
+        started_at_unix_ms: entry.started_at_unix_ms,
     }
 }

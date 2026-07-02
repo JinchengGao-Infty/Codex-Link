@@ -275,6 +275,10 @@ fn render_snapshot_line(snapshot: &JobSnapshot, invocation: &ToolInvocation) -> 
         truncate_command(&snapshot.command),
         snapshot.cwd
     );
+    if snapshot.started_at_unix_ms > 0 {
+        let elapsed_ms = crate::turn_timing::now_unix_timestamp_ms() - snapshot.started_at_unix_ms;
+        line.push_str(&format!(" | started {} ago", format_elapsed(elapsed_ms)));
+    }
     if let Some(description) = &snapshot.background_description {
         line.push_str(&format!(" | {description}"));
     }
@@ -344,6 +348,17 @@ fn missing_log_message(session_id: i32, log_path: &Path) -> String {
             "no session {session_id} in this thread: nothing is tracked under that id and no log file exists at {}.",
             log_path.display()
         )
+    }
+}
+
+fn format_elapsed(elapsed_ms: i64) -> String {
+    let seconds = elapsed_ms.max(0) / 1_000;
+    if seconds < 120 {
+        format!("{seconds}s")
+    } else if seconds < 120 * 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3_600)
     }
 }
 

@@ -982,6 +982,7 @@ impl UnifiedExecProcessManager {
             background_triggers: background_triggers.clone(),
             session: Arc::downgrade(&context.session),
             last_used: started_at,
+            started_at_unix_ms: crate::turn_timing::now_unix_timestamp_ms(),
         };
         let pruned_entry = {
             let mut store = self.process_store.lock().await;
