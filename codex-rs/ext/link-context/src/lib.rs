@@ -71,6 +71,7 @@ const MAX_BACKGROUND_EVENT_TAIL_CHARS: usize = 2_000;
 pub mod evidence;
 mod gc;
 mod persistence;
+mod rules;
 mod tool;
 
 pub use evidence::EvidenceKind;
@@ -1019,6 +1020,14 @@ impl ContextContributor for LinkContextExtension {
                     ));
                 }
             }
+            // Typed rules: always-apply and glob-activated bodies plus a
+            // bounded index of the rest. Renders per turn because the
+            // matched set grows with the session's touched files.
+            if let Some(rules) = input.thread_store.get::<rules::LinkRules>()
+                && let Some(rendered) = rules.render(&state.files_touched)
+            {
+                fragments.push(PromptFragment::new(PromptSlot::ContextualUser, rendered));
+            }
             fragments
         })
     }
@@ -1031,6 +1040,12 @@ impl ThreadLifecycleContributor<codex_core::config::Config> for LinkContextExten
     ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             self.ensure_background_runtime(input.thread_store);
+            // Typed rules load once per thread start; they are static files,
+            // so no re-scan happens mid-thread.
+            input.thread_store.insert(rules::LinkRules::load(
+                input.config.cwd.as_path(),
+                &input.config.codex_home,
+            ));
             // Review subagents are ephemeral; only durable threads get a
             // sidecar file. Resumed threads run this same path, so hydration
             // after a process restart happens here as well.
@@ -2489,6 +2504,44 @@ mod tests {
             restored.snapshot().next_action,
             Some("recovered".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn contribute_turn_context_renders_rules_fragment() {
+        let contributor = LinkContextExtension::default();
+        let session_store = ExtensionData::new("session");
+        let thread_store = ExtensionData::new("thread");
+        let turn_store = ExtensionData::new("turn");
+
+        thread_store.insert(rules::LinkRules {
+            project_root: std::path::PathBuf::from("/project"),
+            rules: vec![rules::LinkRule {
+                name: "base".to_string(),
+                path: std::path::PathBuf::from("/project/.codex/rules/base.md"),
+                description: None,
+                globs: Vec::new(),
+                always_apply: true,
+                body: "Prefer small modules.".to_string(),
+            }],
+        });
+
+        let fragments = contributor
+            .contribute_turn_context(TurnContextContributionInput {
+                thread_id: codex_protocol::ThreadId::default(),
+                turn_id: "turn-1",
+                session_store: &session_store,
+                thread_store: &thread_store,
+                turn_store: &turn_store,
+                model_context_window: Some(200_000),
+            })
+            .await;
+        let rules_fragment = fragments
+            .iter()
+            .find(|fragment| fragment.text().contains("<codex_link_rules>"))
+            .expect("rules fragment should render");
+        assert_eq!(rules_fragment.slot(), PromptSlot::ContextualUser);
+        assert!(rules_fragment.text().contains("[always] base"));
+        assert!(rules_fragment.text().contains("Prefer small modules."));
     }
 
     #[tokio::test]

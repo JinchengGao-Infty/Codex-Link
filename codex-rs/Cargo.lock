@@ -3269,6 +3269,7 @@ dependencies = [
  "codex-tools",
  "codex-utils-output-truncation",
  "codex-utils-path-uri",
+ "globset",
  "pretty_assertions",
  "serde",
  "serde_json",
