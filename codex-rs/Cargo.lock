@@ -1993,6 +1993,7 @@ dependencies = [
  "codex-home",
  "codex-hooks",
  "codex-image-generation-extension",
+ "codex-link-context-extension",
  "codex-login",
  "codex-mcp",
  "codex-mcp-extension",
@@ -2668,6 +2669,7 @@ dependencies = [
  "codex-hooks",
  "codex-image-generation-extension",
  "codex-install-context",
+ "codex-link-context-extension",
  "codex-login",
  "codex-mcp",
  "codex-memories-read",
@@ -3253,6 +3255,23 @@ name = "codex-keyring-store"
 version = "0.0.0"
 dependencies = [
  "keyring",
+ "tracing",
+]
+
+[[package]]
+name = "codex-link-context-extension"
+version = "0.0.0"
+dependencies = [
+ "codex-core",
+ "codex-extension-api",
+ "codex-protocol",
+ "codex-state",
+ "codex-utils-output-truncation",
+ "codex-utils-path-uri",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

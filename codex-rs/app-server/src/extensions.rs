@@ -60,18 +60,28 @@ where
         thread_store: _thread_store,
     } = dependencies;
     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(event_sink);
+    let link_goal_state = state_db.clone();
     if let Some(state_db) = state_db {
         codex_goal_extension::install_with_backend(
             &mut builder,
             state_db,
             analytics_events_client,
             codex_otel::global(),
-            thread_manager,
+            thread_manager.clone(),
             goal_service,
             |config: &Config| config.features.enabled(codex_features::Feature::Goals),
         );
     }
     codex_guardian::install(&mut builder, guardian_agent_spawner);
+    if let Some(state_db) = link_goal_state {
+        codex_link_context_extension::install_with_goal_state_and_thread_manager(
+            &mut builder,
+            state_db,
+            thread_manager,
+        );
+    } else {
+        codex_link_context_extension::install_with_thread_manager(&mut builder, thread_manager);
+    }
     codex_memories_extension::install(&mut builder, codex_otel::global());
     codex_mcp_extension::install(&mut builder);
     codex_mcp_extension::install_executor_plugins(&mut builder, environment_manager);
