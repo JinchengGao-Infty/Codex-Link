@@ -38,7 +38,10 @@ use codex_extension_api::TurnEventFuture;
 use codex_extension_api::TurnEventInput;
 use codex_extension_api::TurnItemContributor;
 use codex_protocol::ThreadId;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::FileChangeItem;
+use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
@@ -62,6 +65,8 @@ const DEFAULT_MAX_CAPSULE_TOKENS: usize = 1_500;
 const DEFAULT_MAX_FIELD_CHARS: usize = 1_200;
 const MAX_RECORDED_TOOL_EVENTS: usize = 16;
 const MAX_RECORDED_FILES_TOUCHED: usize = 32;
+const MAX_RECORDED_PROGRESS_ITEMS: usize = 16;
+const MAX_TASK_FACT_CHARS: usize = 500;
 const MAX_TOOL_EVENT_CHARS: usize = 900;
 const MAX_TOOL_OUTPUT_PREVIEW_CHARS: usize = 600;
 const MAX_PENDING_BACKGROUND_EVENTS: usize = 16;
@@ -587,11 +592,57 @@ impl LinkContextStore {
                     Some(MAX_RECORDED_FILES_TOUCHED),
                     DEFAULT_MAX_FIELD_CHARS,
                 );
+                let file_count = paths.len();
+                append_progress(
+                    &mut state.current_progress,
+                    format!("Patch completed touching {file_count} file(s)"),
+                );
             }
             push_evidence(
                 &mut state.verified_evidence,
                 evidence,
                 MAX_RECORDED_TOOL_EVENTS,
+            );
+        });
+    }
+
+    fn record_agent_message(&self, item: &AgentMessageItem) {
+        let text = agent_message_text(item);
+        if text.trim().is_empty() {
+            return;
+        }
+
+        let progress = extract_agent_progress(&text);
+        let next_action = extract_agent_next_action(&text);
+        if progress.is_none() && next_action.is_none() {
+            return;
+        }
+
+        self.update(|state| {
+            if let Some(progress) = progress {
+                append_progress(
+                    &mut state.current_progress,
+                    format!("Agent progress: {progress}"),
+                );
+            }
+            if let Some(next_action) = next_action {
+                state.next_action = Some(truncate_chars(
+                    &format!("Agent next action: {next_action}"),
+                    MAX_TASK_FACT_CHARS,
+                ));
+            }
+        });
+    }
+
+    fn record_plan_item(&self, item: &PlanItem) {
+        let Some(summary) = summarize_plan_text(&item.text) else {
+            return;
+        };
+        self.update(|state| {
+            state.next_action = Some(format!("Plan update: {summary}"));
+            append_progress(
+                &mut state.current_progress,
+                format!("Latest plan: {summary}"),
             );
         });
     }
@@ -1109,8 +1160,23 @@ impl TurnItemContributor for LinkContextExtension {
     ) -> ExtensionFuture<'a, Result<(), String>> {
         let store = thread_store.get_or_init(LinkContextStore::default);
         Box::pin(async move {
-            if let TurnItem::FileChange(item) = item {
-                store.record_file_change(item);
+            match item {
+                TurnItem::AgentMessage(item) => store.record_agent_message(item),
+                TurnItem::Plan(item) => store.record_plan_item(item),
+                TurnItem::FileChange(item) => store.record_file_change(item),
+                TurnItem::UserMessage(_)
+                | TurnItem::HookPrompt(_)
+                | TurnItem::Reasoning(_)
+                | TurnItem::CommandExecution(_)
+                | TurnItem::DynamicToolCall(_)
+                | TurnItem::CollabAgentToolCall(_)
+                | TurnItem::SubAgentActivity(_)
+                | TurnItem::WebSearch(_)
+                | TurnItem::ImageView(_)
+                | TurnItem::Sleep(_)
+                | TurnItem::ImageGeneration(_)
+                | TurnItem::McpToolCall(_)
+                | TurnItem::ContextCompaction(_) => {}
             }
             Ok(())
         })
@@ -1521,6 +1587,116 @@ fn file_change_paths(item: &FileChangeItem) -> Vec<String> {
     paths
 }
 
+fn agent_message_text(item: &AgentMessageItem) -> String {
+    item.content
+        .iter()
+        .map(|content| match content {
+            AgentMessageContent::Text { text } => text.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_agent_progress(text: &str) -> Option<String> {
+    extract_task_sentence(
+        text,
+        &[
+            "已经",
+            "完成",
+            "通过",
+            "确认",
+            "加好了",
+            "改好了",
+            "部署",
+            "推送",
+            "added",
+            "built",
+            "completed",
+            "confirmed",
+            "fixed",
+            "implemented",
+            "installed",
+            "merged",
+            "passed",
+            "pushed",
+            "updated",
+            "wired",
+        ],
+    )
+}
+
+fn extract_agent_next_action(text: &str) -> Option<String> {
+    extract_task_sentence(
+        text,
+        &[
+            "我会",
+            "我先",
+            "我现在",
+            "接下来",
+            "下一步",
+            "然后我",
+            "现在把",
+            "i will",
+            "i'll",
+            "i am going",
+            "i'm going",
+            "next",
+            "now i",
+        ],
+    )
+}
+
+fn extract_task_sentence(text: &str, markers: &[&str]) -> Option<String> {
+    for raw_line in text.lines() {
+        let line = normalize_task_line(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        for sentence in split_task_sentences(&line) {
+            if sentence_matches_any_marker(&sentence, markers) {
+                return sanitize_value(&sentence, MAX_TASK_FACT_CHARS);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_task_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches(|ch: char| {
+            matches!(
+                ch,
+                '-' | '*' | '+' | '•' | '·' | ':' | ';' | ' ' | '\t' | '\u{3000}'
+            )
+        })
+        .trim()
+        .to_string()
+}
+
+fn split_task_sentences(line: &str) -> Vec<String> {
+    line.split(['。', '！', '？', '!', '?'])
+        .flat_map(|part| part.split(". "))
+        .filter_map(|part| sanitize_value(part, MAX_TASK_FACT_CHARS))
+        .collect()
+}
+
+fn sentence_matches_any_marker(sentence: &str, markers: &[&str]) -> bool {
+    let lower = sentence.to_lowercase();
+    markers.iter().any(|marker| {
+        if marker.is_ascii() {
+            lower.contains(marker)
+        } else {
+            sentence.contains(marker)
+        }
+    })
+}
+
+fn summarize_plan_text(text: &str) -> Option<String> {
+    text.lines()
+        .map(normalize_task_line)
+        .find_map(|line| sanitize_value(&line, MAX_TASK_FACT_CHARS))
+}
+
 fn patch_status_label(status: Option<&PatchApplyStatus>) -> &'static str {
     match status {
         Some(PatchApplyStatus::Completed) => "completed",
@@ -1583,6 +1759,15 @@ fn append_unique_values_with_char_limit(
     }
 }
 
+fn append_progress(values: &mut Vec<String>, value: String) {
+    append_unique_values_with_char_limit(
+        values,
+        &[value],
+        Some(MAX_RECORDED_PROGRESS_ITEMS),
+        MAX_TASK_FACT_CHARS,
+    );
+}
+
 fn merge_option(target: &mut Option<String>, source: &Option<String>) {
     let Some(value) = source
         .as_deref()
@@ -1605,7 +1790,10 @@ mod tests {
     use codex_extension_api::ToolName;
     use codex_extension_api::TurnContextContributionInput;
     use codex_extension_api::TurnItemContributor;
+    use codex_protocol::items::AgentMessageContent;
+    use codex_protocol::items::AgentMessageItem;
     use codex_protocol::items::FileChangeItem;
+    use codex_protocol::items::PlanItem;
     use codex_protocol::items::TurnItem;
     use codex_protocol::models::ContentItem;
     use codex_protocol::parse_command::ParsedCommand;
@@ -1885,6 +2073,74 @@ mod tests {
                 "src/lib.rs".to_string(),
                 "src/link.rs".to_string()
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn records_agent_message_task_state_for_mid_turn_compaction() {
+        let contributor = LinkContextExtension::default();
+        let thread_store = ExtensionData::new("thread");
+        let turn_store = ExtensionData::new("turn");
+        let mut item = TurnItem::AgentMessage(AgentMessageItem {
+            id: "agent-1".to_string(),
+            content: vec![AgentMessageContent::Text {
+                text: "API 函数加好了。现在把它接到消息流：只有明确图片/视频请求才走 Imagine API，普通聊天不受影响。"
+                    .to_string(),
+            }],
+            phase: None,
+            memory_citation: None,
+        });
+
+        contributor
+            .contribute(&thread_store, &turn_store, &mut item)
+            .await
+            .expect("agent message contributor should succeed");
+
+        let state = thread_store
+            .get::<LinkContextStore>()
+            .expect("agent message should initialize Link context store")
+            .snapshot();
+
+        assert_eq!(
+            state.current_progress,
+            vec!["Agent progress: API 函数加好了".to_string()]
+        );
+        assert_eq!(
+            state.next_action,
+            Some(
+                "Agent next action: 现在把它接到消息流：只有明确图片/视频请求才走 Imagine API，普通聊天不受影响"
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn records_plan_item_as_task_state_for_mid_turn_compaction() {
+        let contributor = LinkContextExtension::default();
+        let thread_store = ExtensionData::new("thread");
+        let turn_store = ExtensionData::new("turn");
+        let mut item = TurnItem::Plan(PlanItem {
+            id: "plan-1".to_string(),
+            text: "Deploy the bridge changes\nVerify the Telegram media path".to_string(),
+        });
+
+        contributor
+            .contribute(&thread_store, &turn_store, &mut item)
+            .await
+            .expect("plan contributor should succeed");
+
+        let state = thread_store
+            .get::<LinkContextStore>()
+            .expect("plan item should initialize Link context store")
+            .snapshot();
+
+        assert_eq!(
+            state.current_progress,
+            vec!["Latest plan: Deploy the bridge changes".to_string()]
+        );
+        assert_eq!(
+            state.next_action,
+            Some("Plan update: Deploy the bridge changes".to_string())
         );
     }
 
