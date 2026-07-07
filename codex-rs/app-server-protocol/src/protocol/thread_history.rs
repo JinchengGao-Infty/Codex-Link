@@ -1860,6 +1860,8 @@ mod tests {
             }],
             source: ExecCommandSource::Agent,
             interaction_input: None,
+            background_description: None,
+            background_triggers: Vec::new(),
             status: CoreCommandExecutionStatus::Completed,
             stdout: Some("hello world\n".to_string()),
             stderr: Some(String::new()),
