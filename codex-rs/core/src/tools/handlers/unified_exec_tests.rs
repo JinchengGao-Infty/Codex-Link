@@ -380,7 +380,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
 }
 
 #[tokio::test]
-async fn exec_command_short_yield_running_foreground_command_stays_interactive()
+async fn exec_command_short_yield_running_non_tty_command_becomes_supervised_background()
 -> anyhow::Result<()> {
     skip_if_sandbox!(Ok(()));
 
@@ -408,6 +408,64 @@ async fn exec_command_short_yield_running_foreground_command_stays_interactive()
 
     let output = ExecCommandHandler::default().handle(invocation).await?;
     let response = output.to_response_item("call-auto-bg", &payload);
+
+    let ResponseInputItem::FunctionCallOutput {
+        output: payload_output,
+        ..
+    } = response
+    else {
+        panic!("expected function-call output");
+    };
+    let text = payload_output
+        .body
+        .to_text()
+        .expect("exec output should serialize as text");
+
+    assert!(text.contains("Background mode: true"));
+    assert!(text.contains("Background triggers: on_exit"));
+    assert!(text.contains("Background log:"));
+    assert!(text.contains("Background watcher:"));
+    assert!(text.contains("Process running with session ID"));
+    assert!(output.ends_turn_after_record());
+
+    for process in session.list_background_terminals().await {
+        if let Ok(process_id) = process.process_id.parse::<i32>() {
+            session.terminate_background_terminal(process_id).await;
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn exec_command_short_yield_running_tty_command_stays_interactive() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "cmd": "sleep 5",
+            "yield_time_ms": 250,
+            "tty": true,
+        })
+        .to_string(),
+    };
+    let invocation = ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "call-interactive".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload: payload.clone(),
+    };
+
+    let output = ExecCommandHandler::default().handle(invocation).await?;
+    let response = output.to_response_item("call-interactive", &payload);
 
     let ResponseInputItem::FunctionCallOutput {
         output: payload_output,

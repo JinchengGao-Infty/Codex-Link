@@ -583,6 +583,89 @@ async fn non_detached_short_yield_session_exit_does_not_emit_background_trigger(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_tty_short_yield_session_exit_emits_background_trigger() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let command = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        "sleep 1; printf 'non-tty done\\n'".to_string(),
+    ];
+    #[allow(deprecated)]
+    let cwd = turn.cwd.clone().into();
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "call-short-yield-non-tty".to_string(),
+    );
+
+    let response = manager
+        .exec_command(
+            ExecCommandRequest {
+                command: command.clone(),
+                shell_type: crate::shell::ShellType::Sh,
+                hook_command: command.join(" "),
+                process_id,
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                cwd,
+                #[allow(deprecated)]
+                sandbox_cwd: turn.cwd.clone().into(),
+                turn_environment: turn
+                    .environments
+                    .primary()
+                    .cloned()
+                    .expect("primary environment"),
+                shell_mode: codex_tools::UnifiedExecShellMode::Direct,
+                network: None,
+                tty: false,
+                sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                additional_permissions_preapproved: false,
+                justification: None,
+                prefix_rule: None,
+                background_description: Some(
+                    "Auto-backgrounded non-interactive command".to_string(),
+                ),
+                background_triggers: vec!["on_exit".to_string()],
+                background_trigger_policy: None,
+                background_log_path: None,
+                background_declared: false,
+                end_turn_after_record: false,
+            },
+            &context,
+        )
+        .await?;
+
+    assert_eq!(response.process_id, Some(process_id));
+    assert!(response.background.is_some());
+    assert!(response.end_turn_after_record);
+
+    let trigger_event = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = rx_event.recv().await.expect("event channel open");
+            if let codex_protocol::protocol::EventMsg::ExecBackgroundTrigger(trigger_event) =
+                event.msg
+                && trigger_event.call_id == "call-short-yield-non-tty"
+            {
+                return trigger_event;
+            }
+        }
+    })
+    .await?;
+
+    assert_eq!(trigger_event.process_id, process_id.to_string());
+    assert_eq!(trigger_event.trigger, "on_exit");
+    assert_eq!(trigger_event.reason, "process exited with code 0");
+    assert!(trigger_event.output_tail.contains("non-tty done"));
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct TestSpawnLifecycle {
     inherited_fds: Vec<i32>,

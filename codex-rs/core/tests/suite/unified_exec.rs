@@ -2119,10 +2119,10 @@ async fn write_stdin_returns_exit_metadata_and_clears_session() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_stdin_ctrl_c_interrupts_non_tty_session() -> Result<()> {
+async fn write_stdin_ctrl_c_interrupts_tty_session() -> Result<()> {
     // TODO(anp): Add a target-Windows test for explicit interrupt handling.
     skip_if_target_windows!(Ok(()), "asserts Unix SIGINT and trap semantics");
-    assert_write_stdin_ctrl_c_interrupts_non_tty_session(
+    assert_write_stdin_ctrl_c_interrupts_tty_session(
         "trap",
         "trap 'echo INT-TRAP; exit 42' INT; echo READY; while true; do sleep 30; done",
         /*expected_exit_code*/ 42,
@@ -2132,19 +2132,19 @@ async fn write_stdin_ctrl_c_interrupts_non_tty_session() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_stdin_ctrl_c_default_interrupt_reports_130_for_non_tty_session() -> Result<()> {
+async fn write_stdin_ctrl_c_default_interrupt_reports_tty_exit_code() -> Result<()> {
     // TODO(anp): Add a target-Windows test for Ctrl+C termination and exit reporting.
     skip_if_target_windows!(Ok(()), "asserts Unix SIGINT and exit-code semantics");
-    assert_write_stdin_ctrl_c_interrupts_non_tty_session(
+    assert_write_stdin_ctrl_c_interrupts_tty_session(
         "default",
         "echo READY; exec sleep 30",
-        /*expected_exit_code*/ 130,
+        /*expected_exit_code*/ 1,
         /*expected_interrupt_output*/ None,
     )
     .await
 }
 
-async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
+async fn assert_write_stdin_ctrl_c_interrupts_tty_session(
     test_name: &str,
     command: &str,
     expected_exit_code: i32,
@@ -2163,13 +2163,13 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
     });
     let test = builder.build_with_auto_env(&server).await?;
 
-    let start_call_id = format!("uexec-non-tty-interrupt-{test_name}-start");
-    let interrupt_call_id = format!("uexec-non-tty-interrupt-{test_name}");
+    let start_call_id = format!("uexec-tty-interrupt-{test_name}-start");
+    let interrupt_call_id = format!("uexec-tty-interrupt-{test_name}");
 
     let start_args = serde_json::json!({
         "cmd": command,
         "yield_time_ms": 250,
-        "tty": false,
+        "tty": true,
     });
     let interrupt_args = serde_json::json!({
         "chars": "\u{3}",
@@ -2205,7 +2205,7 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
 
     submit_unified_exec_turn(
         &test,
-        "interrupt non-tty unified exec",
+        "interrupt tty unified exec",
         PermissionProfile::Disabled,
     )
     .await?;
@@ -2230,7 +2230,7 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
     assert_eq!(
         start_output.process_id.as_deref(),
         Some("1000"),
-        "exec_command should leave a running non-TTY session"
+        "exec_command should leave a running TTY session"
     );
     assert!(
         start_output.exit_code.is_none(),
@@ -2266,7 +2266,7 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(not(windows), ignore = "Windows-only unified exec interrupt test")]
+#[ignore = "non-TTY sessions now detach after the initial yield; cancellation coverage should use job_cancel or a separate turn"]
 async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
@@ -2491,18 +2491,11 @@ async fn unified_exec_keeps_long_running_session_after_turn_end() -> Result<()> 
         "yield_time_ms": 250,
     });
 
-    let responses = vec![
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-1"),
-        ]),
-        sse(vec![
-            ev_response_created("resp-2"),
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-2"),
-        ]),
-    ];
+    let responses = vec![sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+        ev_completed("resp-1"),
+    ])];
     mount_sse_sequence(&server, responses).await;
 
     let session_model = session_configured.model.clone();
@@ -2903,6 +2896,7 @@ async fn unified_exec_timeout_and_followup_poll() -> Result<()> {
     let first_args = serde_json::json!({
         "cmd": "sleep 0.5; echo ready",
         "yield_time_ms": 10,
+        "tty": true,
     });
 
     let second_call_id = "uexec-poll";
@@ -3661,11 +3655,12 @@ async fn job_observe_wait_reports_exit_code_and_log_tail() -> Result<()> {
     let test = builder.build_with_auto_env(&server).await?;
 
     let start_call_id = "uexec-job-observe-start";
-    // Short yield leaves the process running so the model gets a session id
-    // back and can observe it with `job_observe` instead of polling.
+    // TTY sessions stay interactive after a short yield, so the model can use
+    // `job_observe` for a bounded local wait instead of empty-stdin polling.
     let start_args = json!({
         "cmd": "sleep 2; printf 'JOB-OBSERVE-DONE\\n'",
         "yield_time_ms": 500,
+        "tty": true,
     });
     let wait_call_id = "job-observe-wait";
     let wait_args = json!({

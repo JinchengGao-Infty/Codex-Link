@@ -505,6 +505,7 @@ impl UnifiedExecProcessManager {
         // Persist live sessions before the initial yield wait so interrupting the
         // turn cannot drop the last Arc and terminate the background process.
         let process_started_alive = !process.has_exited() && process.exit_code().is_none();
+        let notify_background_exit = request.end_turn_after_record || !request.tty;
         let _initial_exec_command_guard = if process_started_alive {
             let initial_exec_command_active = Arc::new(AtomicBool::new(true));
             self.store_process(
@@ -522,7 +523,7 @@ impl UnifiedExecProcessManager {
                 background_event_notifier.clone(),
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
-                request.end_turn_after_record,
+                notify_background_exit,
             )
             .await;
             Some(InitialExecCommandGuard {
@@ -698,7 +699,7 @@ impl UnifiedExecProcessManager {
 
         let original_token_count = approx_token_count(&text);
         let response_is_supervised_background =
-            response_process_id.is_some() && request.end_turn_after_record;
+            response_process_id.is_some() && notify_background_exit;
         let response = ExecCommandToolOutput {
             event_call_id: context.call_id.clone(),
             chunk_id,
