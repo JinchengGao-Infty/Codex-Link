@@ -1176,7 +1176,10 @@ impl TurnItemContributor for LinkContextExtension {
                 | TurnItem::Sleep(_)
                 | TurnItem::ImageGeneration(_)
                 | TurnItem::McpToolCall(_)
-                | TurnItem::ContextCompaction(_) => {}
+                | TurnItem::ContextCompaction(_)
+                | TurnItem::Extension(_)
+                | TurnItem::EnteredReviewMode(_)
+                | TurnItem::ExitedReviewMode(_) => {}
             }
             Ok(())
         })
